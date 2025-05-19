@@ -861,3 +861,43 @@ class RecursiveMeanScaleHyperprior(CompressionModule):
         medians = self.entropy_bottleneck._extend_ndims(medians, spatial_dims)
         medians = medians.expand(x.size(0), *([-1] * (spatial_dims + 1)))
         return medians
+
+class FiLMedHFactorizedPriorCompressionModule(FactorizedPriorModule):
+    def __init__(self,
+                 entropy_bottleneck_channels,
+                 analysis_config, # This will now point to TaskConditionedFiLMedAnalysisNetwork
+                 synthesis_config=None,
+                 quantization_config=None):
+        super().__init__(entropy_bottleneck_channels,
+                         analysis_config, # g_a is created here
+                         synthesis_config,
+                         quantization_config=quantization_config)
+
+    # Modify forward methods to accept features from stem and conditioning_signal
+    def forward_train(self, x_from_stem, return_likelihoods=False, conditioning_signal=None):
+        y = self.g_a(x_from_stem, conditioning_signal=conditioning_signal) # Pass signal to g_a
+        # ... rest of the logic ...
+        y_hat, y_likelihoods = self.entropy_bottleneck(y)
+        x_hat_features = self.g_s(y_hat) # g_s reconstructs features for the backbone
+        if return_likelihoods:
+            return x_hat_features, {"y": y_likelihoods}
+        else:
+            return x_hat_features
+
+    def forward(self, x_from_stem, return_likelihoods=False, conditioning_signal=None):
+        if self.updated and not return_likelihoods: # Inference
+            y = self.g_a(x_from_stem, conditioning_signal=conditioning_signal)
+            # ... quantization and dequantization ...
+            y_h = self.entropy_bottleneck.dequantize(
+                self.entropy_bottleneck.quantize(y, 'dequantize', self.get_means(y))
+            )
+            y_h = y_h.detach()
+            x_hat_features = self.g_s(y_h)
+            return x_hat_features
+        return self.forward_train(x_from_stem, return_likelihoods, conditioning_signal=conditioning_signal)
+
+    def compress(self, x_from_stem, conditioning_signal=None, *args, **kwargs):
+        y = self.g_a(x_from_stem, conditioning_signal=conditioning_signal)
+        # ... compression logic for y ...
+        y_strings = self.entropy_bottleneck.compress(y)
+        return y_strings, y.size()[2:] # Example output

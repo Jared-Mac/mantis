@@ -12,7 +12,7 @@ from model.modules.layers.conv import ConvGDNBlock, ResidualBlockWithStride
 from model.modules.layers.preconfigured import get_layer_preconfiguration
 from model.modules.layers.transf import HybridSwinStage
 from model.modules.module_registry import register_analysis_network
-
+from .layers.film import FiLMGenerator, FiLMLayer
 
 class AnalysisNetwork(nn.Module):
     def __init__(self):
@@ -85,3 +85,73 @@ class QuantizableSimpleAnalysisNetwork2(AnalysisNetwork):
         x = self.rb2(x)
         x = self.rb3(x)
         return x
+    
+@register_analysis_network
+class TaskConditionedFiLMedAnalysisNetwork(AnalysisNetwork):
+    def __init__(self, 
+                 input_channels_from_stem, # Number of channels from SharedInputStem
+                 latent_channels,          # Desired output channels for the latent space (y)
+                 block_configs,            # List of configs for each main block
+                                           # e.g., [{'out_channels': N, 'kernel': K, 'stride': S, 'padding': P, 'apply_film': True/False}, ...]
+                 film_cond_dim,            # Dimensionality of the conditioning signal from task probability model
+                 film_generator_hidden_dim=None): # Optional: hidden dim for the FiLMGenerator MLP
+        super().__init__()
+        self.film_cond_dim = film_cond_dim
+
+        self.main_blocks = nn.ModuleList()
+        self.film_generators = nn.ModuleDict()
+        self.film_layers = nn.ModuleDict()
+
+        current_ch = input_channels_from_stem
+        for i, b_config in enumerate(block_configs):
+            # Using ConvGDNBlock as example, you can make this configurable too
+            block = ConvGDNBlock(
+                in_channels=current_ch,
+                out_channels=b_config['out_channels'],
+                kernel_size=b_config['kernel_size'],
+                stride=b_config['stride'],
+                padding=b_config['padding'],
+                bias=False
+            )
+            self.main_blocks.append(block)
+            current_ch = b_config['out_channels']
+
+            if b_config.get('apply_film', False):
+                if self.film_cond_dim is None:
+                    raise ValueError("film_cond_dim must be provided if apply_film is true in any block_config")
+                
+                gen_key = f"film_gen_{i}"
+                layer_key = f"film_layer_{i}"
+                
+                self.film_generators[gen_key] = FiLMGenerator(
+                    cond_dim=self.film_cond_dim,
+                    num_features=current_ch, # Modulate the output of this block
+                    hidden_dim=film_generator_hidden_dim
+                )
+                self.film_layers[layer_key] = FiLMLayer()
+        
+        # Ensure final output has `latent_channels`
+        if current_ch != latent_channels:
+            self.final_projection = nn.Conv2d(current_ch, latent_channels, kernel_size=1)
+        else:
+            self.final_projection = nn.Identity()
+
+    def forward(self, x_from_stem, conditioning_signal=None): # x_from_stem is output of SharedInputStem
+        output = x_from_stem
+        for i, block_module in enumerate(self.main_blocks):
+            output = block_module(output)
+            
+            gen_key = f"film_gen_{i}"
+            if gen_key in self.film_generators:
+                if conditioning_signal is not None:
+                    gamma, beta = self.film_generators[gen_key](conditioning_signal)
+                    output = self.film_layers[f"film_layer_{i}"](output, gamma, beta)
+                else:
+                    # Recommended: If FiLM is integral, raise error. If optional, could skip.
+                    # For now, we assume if configured, signal should be there for FiLM to apply.
+                    # Or, you could have a mode where it passes through if signal is None.
+                    print(f"Warning: TaskConditionedFiLMedAnalysisNetwork expects a conditioning_signal for block {i} but received None. FiLM not applied.")
+        
+        output = self.final_projection(output)
+        return output
+

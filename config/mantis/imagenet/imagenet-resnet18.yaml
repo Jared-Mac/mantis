@@ -1,0 +1,266 @@
+# Fully Specified End-to-End YAML Configuration
+# This configuration defines a multi-task learning setup with a shared input stem,
+# a task probability model generating FiLM conditioning signals, and a FiLM-conditioned
+# analysis network within the compression module.
+
+datasets:
+  # 1. Base ImageNet Dataset Definition (used by the wrapper below)
+  # This section defines how to load the raw ImageFolder.
+  # It's not directly used by the dataloader but is referenced by the wrapper.
+  ilsvrc2012_base_definition: 
+    name: 'ilsvrc2012' 
+    type: 'ImageFolder' 
+    root: '~/resources/datasets/ilsvrc2012' # <<< ADJUST PATH HERE
+    transform_params: 
+      train:
+        - type: 'RandomResizedCrop'
+          params:
+            size: [ 224, 224 ]
+        - type: 'RandomHorizontalFlip'
+          params:
+            p: 0.5
+        - type: 'ToTensor'
+          params: {}
+        - type: 'Normalize'
+          params:
+            mean: [ 0.485, 0.456, 0.406 ]
+            std: [ 0.229, 0.224, 0.225 ]
+      val:
+        - type: 'Resize'
+          params:
+            size: 256
+        - type: 'CenterCrop'
+          params:
+            size: [ 224, 224 ]
+        - type: 'ToTensor'
+          params: {}
+        - type: 'Normalize'
+          params:
+            mean: [ 0.485, 0.456, 0.406 ]
+            std: [ 0.229, 0.224, 0.225 ]
+
+  # 2. LabelChunkedTaskDataset Configuration (This is what the DataLoader will use)
+  imagenet_label_chunked_for_tasks:
+    name: 'imagenet_label_chunked_for_tasks'
+    type: 'LabelChunkedTaskDataset' # Your custom wrapper class
+    splits:
+      train:
+        dataset_id: 'imagenet_label_chunked_for_tasks/train'
+        params: 
+          original_dataset: 
+            type: 'ImageFolder' 
+            params:
+              root: '~/resources/datasets/ilsvrc2012/train' # <<< ADJUST PATH HERE
+              transform_params: # This list of dicts will be parsed by your transform utility
+                - type: 'RandomResizedCrop'
+                  params:
+                    size: [ 224, 224 ]
+                - type: 'RandomHorizontalFlip'
+                  params:
+                    p: 0.5
+                - type: 'ToTensor'
+                  params: {}
+                - type: 'Normalize'
+                  params:
+                    mean: [ 0.485, 0.456, 0.406 ]
+                    std: [ 0.229, 0.224, 0.225 ]
+          task_configs: 
+            - task_id: 0
+              original_labels: { range: [0, 500] } # Represents range(0, 500) -> labels 0...499
+            - task_id: 1
+              original_labels: { range: [500, 1000] } # Represents range(500, 1000) -> labels 500...999 
+          default_task_id: -1      
+          default_task_label: -1   
+      val:
+        dataset_id: 'imagenet_label_chunked_for_tasks/val'
+        params: 
+          original_dataset:
+            type: 'ImageFolder'
+            params:
+              root: '~/resources/datasets/ilsvrc2012/val' # <<< ADJUST PATH HERE
+              transform_params:
+                - type: 'Resize'
+                  params:
+                    size: 256
+                - type: 'CenterCrop'
+                  params:
+                    size: [ 224, 224 ]
+                - type: 'ToTensor'
+                  params: {}
+                - type: 'Normalize'
+                  params:
+                    mean: [ 0.485, 0.456, 0.406 ]
+                    std: [ 0.229, 0.224, 0.225 ]
+          task_configs: 
+            - task_id: 0
+              original_labels: { range: [0, 500] }
+            - task_id: 1
+              original_labels: { range: [500, 1000] }
+          default_task_id: -1
+          default_task_label: -1
+
+models:
+  lmbda: 0.025 
+  distortion_metric_name: 'MSELoss' 
+
+  student_model:
+    name: 'splittable_network_with_compressor_with_shared_stem' 
+    params:
+      network_type: "FrankensplitNetworkWithSharedStem" 
+
+      shared_stem_config:
+        name: "SharedInputStem" 
+        params:
+          in_channels: 3
+          initial_out_channels: 64  
+          num_stem_layers: 3        
+          final_stem_channels: 128  
+
+      task_probability_model_config:
+        name: "TaskProbabilityModel" 
+        params:
+          # input_channels_from_stem: 128 (set dynamically from shared_stem_config.final_stem_channels)
+          output_cond_signal_dim: 64   # This determines film_cond_dim for analysis network
+          hidden_dims: [128, 96]       
+          dropout_rate: 0.1
+
+      compression_module_config:
+        name: "FiLMedHFactorizedPriorCompressionModule" 
+        params:
+          entropy_bottleneck_channels: 192 
+          analysis_config: 
+            name: "TaskConditionedFiLMedAnalysisNetwork"
+            params:
+              # input_channels_from_stem: 128 (set dynamically)
+              latent_channels: 192 
+              block_configs: 
+                - {out_channels: 192, kernel_size: 5, stride: 2, padding: 2, apply_film: True}  # Input: 128ch (stem) -> 192ch. Output H/2, W/2 (e.g. 28x28 -> 14x14)
+                - {out_channels: 192, kernel_size: 3, stride: 1, padding: 1, apply_film: True}  # Input: 192ch -> 192ch (latent_dim). Output H/2, W/2 (e.g. 14x14)
+              # film_cond_dim: 64 (set dynamically from task_probability_model_config)
+              film_generator_hidden_dim: 128 
+          synthesis_config: 
+            name: "SimpleSynthesisNetwork" 
+            params:
+              in_channels: 192 # Must match analysis_config.latent_channels
+              target_channels: 64 # Output channels for the backbone
+              # For SimpleSynthesisNetwork, if it uses a 'channels' list for its structure:
+              # Example: latent (192ch, 14x14) -> upsample -> 128ch, 28x28 -> upsample -> 64ch, 56x56
+              channels: [192, 128, 64, 64] # Last element is target_channels
+          quantization_config: 
+            backend: 'fbgemm' 
+            quant_device: 'cpu' 
+            
+      backbone_config:
+        name: get_timm_model 
+        params:
+          timm_model_name: "resnet18"
+          pretrained: true 
+          no_classes: 1000 
+          skip_embed: true 
+          split_idx: 1     
+                           
+      reconstruction_layer_for_backbone_config: 
+        name: null # Explicitly no separate reconstruction layer if synthesis output is already tailored (e.g. 64 channels for ResNet18 layer1)
+        # params: {} # If name is null, params are ignored.
+                    # If you had a layer:
+                    # name: "ProjectionReconLayer"
+                    # params:
+                    #   in_channels: 64 # Should match synthesis_config.target_channels
+                    #   target_channels: 64 # Expected by backbone after its own stem is skipped
+
+      analysis_config_parent: 
+        analyze_after_compress: True 
+        analyzers_config:
+          - type: 'DiskFileSizeAndBppAnalyzer' 
+            params:
+              unit: 'KB' 
+  
+  teacher_model: # Optional, if not doing distillation, can be removed or ignored by training script
+    name: 'get_timm_model'
+    params:
+      timm_model_name: 'resnet18' 
+      pretrained: True
+      no_classes: 1000
+
+train:
+  log_freq: 200 
+  epoch_to_update: 5 
+
+  stage1: # Example training stage
+    eval_metrics: [ 'accuracy', 'bpp', 'task_predictor_loss_metric', 'task0_accuracy', 'task1_accuracy' ] 
+    num_epochs: 50 
+    
+    train_data_loader:
+      dataset_id: 'imagenet_label_chunked_for_tasks/train' 
+      random_sample: True
+      batch_size: 64 
+      num_workers: 8  
+      pin_memory: True
+      
+    val_data_loader:
+      dataset_id: 'imagenet_label_chunked_for_tasks/val' 
+      random_sample: False
+      batch_size: 128 
+      num_workers: 8
+      pin_memory: True
+    
+    student: 
+      # frozen_modules: ['backbone'] # Example: if pre-training compressor + task_predictor
+      forward_hook:
+        output: 
+          - '' # Captures the full output dictionary from student_model.forward()
+          - 'compression_module.entropy_bottleneck' # Specifically for BppLoss
+      requires_grad: True
+
+    optimizer:
+      type: 'AdamW'
+      params:
+        lr: 0.0001
+        weight_decay: 0.01
+      # module_wise_params: 
+      #   - {modules: ['task_probability_model'], params: {lr: 0.0002}}
+
+    scheduler:
+      type: 'CosineAnnealingLR'
+      params:
+        T_max: 50 
+        eta_min: 0.000001
+
+    criterion:
+      type: 'GeneralizedCustomLoss' 
+      org_term: 
+        criterion:
+          type: 'CrossEntropyLoss'
+          params: {}
+        params: 
+          input: {is_from_teacher: False, module_path: '', io: 'output.main_output'} 
+          target: {is_from_teacher: False, module_path: '', io: 'target[0]'} # Assumes dataset returns (img, (main_target, task_target), ...)
+        factor: 1.0 
+      
+      sub_terms:
+        rate_loss: 
+          criterion:
+            type: 'BppLossOrig' 
+            params:
+              input_sizes: [224, 224] # Explicitly set from input_resolution
+              entropy_module_path: 'compression_module.entropy_bottleneck'
+              reduction: 'mean' 
+          factor: 0.025 # Explicitly set from lmbda
+        
+        task_detector_loss: 
+          criterion:
+            type: 'MultiLabelTaskRelevancyBCELoss' 
+            params:
+              reduction: 'mean' 
+          params:
+            input: {is_from_teacher: False, module_path: '', io: 'output.conditioning_signal_preview'} # Output of TaskProbabilityModel
+            target: {is_from_teacher: False, module_path: '', io: 'target[1]'} # Multi-label binary target for task predictor
+          factor: 0.5 
+
+test:
+  eval_metrics: [ 'accuracy', 'bpp_estimated', 'filesize_kb', 'task_predictor_accuracy' ] 
+  test_data_loader:
+    dataset_id: 'imagenet_label_chunked_for_tasks/val' 
+    random_sample: False
+    batch_size: 1 
+    num_workers: 1

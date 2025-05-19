@@ -296,6 +296,25 @@ class MSELossWithPrecomputedCAMMapSingle(nn.Module):
         return d_.sum()
 
 
+@register_single_loss
+class MultiLabelTaskRelevancyBCELoss(nn.Module):
+    def __init__(self, reduction='mean'):
+        super(MultiLabelTaskRelevancyBCELoss, self).__init__()
+        self.bce_with_logits = nn.BCEWithLogitsLoss(reduction=reduction)
+
+    def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        """
+        Computes the binary cross-entropy loss for multi-label task relevancy.
+
+        Args:
+            input: Tensor of shape (N, C) representing the predicted logits for C tasks.
+            target: Tensor of shape (N, C) representing the binary ground truth labels for C tasks.
+
+        Returns:
+            The computed loss.
+        """
+        return self.bce_with_logits(input, target)
+
 
 @register_loss_wrapper
 class IndexedSimpleLossWrapper(nn.Module):

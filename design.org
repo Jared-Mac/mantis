@@ -1,0 +1,244 @@
+#+title: Design
+#+title: Task-Aware Supervised Compression for Edge Computing
+#+author: Jared Macshane
+#+date: 2025-03-19
+
+* Research Proposal: Task Selection Mechanisms for Multi-task Edge Computing
+
+** Overview
+
+This research aims to address a critical gap in multi-task edge computing: efficient task selection mechanisms for resource-constrained environments. Building on recent advances in supervised compression and multi-task learning, we propose a novel approach that combines the strengths of Ladon's unified multi-task model with early-layer feature-based task selection.
+
+** Background and Related Work
+
+*** Evolution of Edge Computing for Deep Learning Applications
+
+The deployment of deep learning models on resource-constrained edge devices presents significant challenges due to computational, memory, and energy limitations. This has led to the development of various approaches to enable efficient inference in edge computing environments.
+
+**** Split Computing Paradigms
+
+Matsubara et al. (2022) provide a comprehensive survey of split computing and early exiting approaches for deep learning applications. Split computing divides neural networks between edge devices and servers, with the edge device executing a "head" model that produces a compressed intermediate representation, which is then sent to the server for processing by a "tail" model.
+
+The survey categorizes split computing approaches into:
+- *Split computing without network modification*: Simply dividing existing models at natural bottlenecks
+- *Split computing with bottleneck injection*: Introducing artificial compression points to reduce communication costs
+- *Various training methodologies*: Including knowledge distillation and head network distillation
+- *Early exiting strategies*: Introducing multiple exit points in neural networks to terminate inference early for "easy" samples
+
+These approaches primarily focus on single-task scenarios and don't address the challenges of multi-task deployment in edge environments.
+
+**** Supervised Compression for Split Computing
+
+Building on split computing concepts, Matsubara et al. (2022) introduced SC2 (Supervised Compression for Split Computing), which learns compressed representations specifically optimized for downstream tasks rather than for input reconstruction. This approach significantly outperforms traditional input compression methods by focusing only on task-relevant information.
+
+**** Entropic Student: Knowledge Distillation for Feature Compression
+
+Matsubara et al. (2022) further advanced supervised compression with their "Entropic Student" approach, which combines knowledge distillation with neural data compression for split computing systems. Instead of simply splitting existing models or introducing deterministic bottlenecks, Entropic Student leverages:
+
+***** Neural Feature Compression via Variational Bottleneck
+- Integrates ideas from variational inference-based data compression
+- Creates a stochastic bottleneck with a learnable entropy model
+- Optimizes a variational information bottleneck objective to balance information content and bitrate
+
+***** Knowledge Distillation Framework
+- Uses a teacher model to guide a smaller student model with a compression bottleneck
+- Trains the student to match the teacher's intermediate features rather than just final outputs
+- Allows for more efficient compression of task-relevant information
+
+***** Multi-Task Adaptation Capabilities
+- Enables fine-tuning for different downstream tasks (classification, detection, segmentation)
+- Maintains a fixed encoder on the client device while adapting decoders on the server
+- Demonstrates that a single compressor can serve multiple vision tasks
+
+Comparing Entropic Student with traditional input compression methods like JPEG or WebP, as well as with channel reduction and bottleneck quantization approaches, showed significantly better rate-distortion performance. The approach achieved both reduced bandwidth requirements and lower end-to-end latency, particularly important for resource-constrained edge computing environments.
+
+While Entropic Student represents a significant advancement in neural feature compression for split computing, it still executes all tasks rather than selectively choosing which tasks are relevant for a given input.
+
+**** Optimal Task Allocation in Split Computing
+
+Callegaro et al. (2020) addressed the challenge of optimal task allocation in time-varying edge computing systems with split DNNs. Their work formulated the problem as a Markov process and developed a Linear Fractional Program to identify the optimal stationary state-action distribution that minimizes overall average inference time under constraints.
+
+This approach demonstrated the advantage of dynamic control strategies over fixed strategies but did not address multi-task scenarios or task selection mechanisms.
+
+**** Multi-Task Learning for Edge Computing
+
+Recent approaches to multi-task edge computing have evolved to address the limitations of traditional split computing, particularly for scenarios requiring multiple inference tasks with resource constraints.
+
+***** Ladon (2025)
+- Creates a unified end-to-end multi-task model with shared parameters
+- Uses supervised compression to learn compact representations at early layers
+- Performs all tasks simultaneously in a single forward pass
+- Highly efficient but lacks task selection mechanisms
+
+***** Chimera (2022)
+- Builds task-specific sub-models that tap into a primary model at different layers
+- Extracts features from a primary model to train lightweight secondary task models
+- Assumes application knows which tasks to perform
+- Focuses more on where to split computation than on task selection
+
+***** FrankenSplit (2024)
+Furutanpey et al. introduced FrankenSplit, a novel approach to split computing that shifts focus from executing shallow layers on the client to concentrating local resources on variational compression optimized for machine interpretability. This work represents a significant advancement in feature compression for multi-task edge computing:
+
+****** Resource-Asymmetry Awareness
+FrankenSplit acknowledges the fundamental asymmetry between edge devices and servers, demonstrating empirically that having mobile devices execute shallow layers of large models is inefficient in terms of overall latency. Their experiments show that client devices may contribute only 0.02-0.9% of model execution while consuming disproportionate computation time (9-67%).
+
+****** Shallow Variational Bottleneck Injection (SVBI)
+Unlike previous approaches that place bottlenecks at deeper layers (DVBI), FrankenSplit shifts the bottleneck to shallow layers of the network while addressing the challenges this creates. The authors introduce a saliency-guided distortion mechanism that improves compression performance by identifying critical spatial locations in feature representations.
+
+****** Architecture-Agnostic Design
+A key contribution is their design heuristic enabling a single lightweight encoder (~140,000 parameters) on the client to support multiple decoder-backbone pairs on the server. This approach:
+- Creates decoder "blueprints" tailored to architectural families
+- Allows one encoder to be reused across multiple tasks
+- Maintains a separation of concerns between compression and prediction
+
+****** Experimental Results
+FrankenSplit achieved 60% lower bitrate than state-of-the-art split computing methods without decreasing accuracy and up to 16x faster inference than offloading with traditional codecs in bandwidth-constrained networks. These results demonstrate the potential of neural feature compression for edge computing scenarios.
+
+While FrankenSplit provides an efficient framework for neural feature compression with multiple backbone models, it does not specifically address task selection - determining which tasks are relevant for a given input. This limitation presents an opportunity for our research.
+
+*** The Task Selection Problem in Multi-Task Edge Computing
+
+Current multi-task models either:
+1. Execute all tasks regardless of relevance (Ladon approach)
+2. Require external mechanisms to determine which tasks to perform (Chimera approach)
+
+This leads to inefficiency when only a subset of tasks is relevant for a given input, which is common in real-world edge computing scenarios. The challenge is further complicated by the need to make task selection decisions early in the processing pipeline to avoid wasting computational resources and bandwidth.
+
+
+** Proposed Approach: Task-Aware Supervised Compression : MANTIS
+
+
+*** Key Components
+
+**** 1. Early-Layer Feature Extraction
+- Extract compact, information-rich features from early convolutional layers
+- Use supervised compression techniques to ensure these features contain task-relevant information
+- Deploy this component on the sensor/mobile device
+- Adopt FrankenSplit's encoder architecture focused exclusively on compression rather than computation
+- Leverage Entropic Student's stochastic bottleneck and knowledge distillation framework for efficient feature compression
+
+**** 2. Lightweight Task Relevance Classifier
+- Train a small, efficient classifier on early-layer features
+- Predict which tasks are relevant for the current input
+- Output a binary mask indicating which tasks to execute
+- Deploy alongside feature extractor on the sensor device
+
+**** 3. Conditional Multi-task Execution
+- Execute only the relevant task-specific components based on the task mask
+- Share computation across selected tasks through a unified backbone
+- Maintain Ladon's parameter efficiency while reducing computational overhead
+- Utilize decoder blueprints to adapt compressed features to task-specific requirements
+
+*** Technical Innovations
+
+**** Stochastic Task-Aware Bottleneck
+- Extend Entropic Student's variational bottleneck with task relevance signals
+- Use knowledge distillation to train both the feature compression and task selection components
+- Employ a learnable entropy model to achieve optimal bitrate for compressed features
+- Balance supervised rate-distortion tradeoff with task selection performance
+
+
+**** Supervised Compression with Task Awareness
+- Jointly optimize for:
+  - Feature compactness (minimize bandwidth requirements)
+  - Task performance (maximize accuracy on selected tasks)
+  - Task selection accuracy (correctly identify relevant tasks)
+- Use head distillation and cross-entropy losses with carefully balanced regularization terms
+
+**** Resource-Asymmetry Aware Architecture
+- Implement a lightweight encoder (~140K parameters) on the edge device
+- Design task-specific decoder blueprints that operate on the server
+- Exploit resource asymmetry by concentrating computational complexity at the server
+- Support reuse of a single encoder across multiple decoder-backbone pairs
+- Create a clear separation between compression and task execution components
+
+**** Hierarchical Decision Making
+- Implement a cascade of decision points at different network depths
+- Allow for progressive refinement of task selection
+- Enable early termination for obvious cases
+- Adapt blueprint architecture to support conditional task paths
+
+**** Uncertainty-Aware Selection
+- Incorporate confidence measures in task selection
+- Provide fallback mechanisms for uncertain cases
+- Balance precision vs. recall based on application requirements
+- Model task relevance as a probabilistic distribution rather than binary decisions
+
+** Evaluation Methodology
+
+*** Metrics
+- *Task Selection Accuracy*: Precision/recall in identifying relevant tasks
+- *End-to-End Performance*: Accuracy on selected tasks
+- *Computational Efficiency*: FLOPs, memory usage, energy consumption
+- *Communication Efficiency*: Bandwidth requirements (bits per pixel)
+- *Latency*: End-to-end processing time across various network conditions
+- *Rate-Distortion Performance*: Bitrate vs. predictive loss across multiple tasks
+
+*** Evaluation Environment
+- *Client Devices*: Resource-constrained edge devices (e.g., NVIDIA Jetson platforms)
+- *Server*: High-performance computing with GPU acceleration
+- *Network Conditions*: Various bandwidth scenarios (5G, 4G LTE, WiFi, BLE)
+- *Workloads*: Single-task and multi-task inference requests with varying complexity
+
+*** Datasets and Tasks
+- ILSVRC 2012 (Image Classification)
+- COCO 2017 (Object Detection)
+- PASCAL VOC 2012 (Semantic Segmentation)
+- Custom multi-task datasets with varying task relevance patterns
+  - ImageNet-21k (Image Classification with 21,000 classes) ~ break many into semantically similar tasks groupings
+    - Battle of backbones implies imagenet21k is best backbone
+
+*** Baselines
+- *Offloading with Traditional Codecs*: PNG, WebP, JPEG
+- *Learned Image Compression*: Recent methods using factorized prior, hyperprior, and autoregressive models
+- *Split Computing Methods*: FrankenSplit, Entropic Student, split runtime systems
+- *Multi-task Models*: Ladon (all tasks executed), Chimera (oracle-based task selection), FrankenSplit (all tasks executed)
+- *Single-task Specialized Models*: Task-specific models for each individual task
+
+*** Ablation Studies (Optional if time allows)
+- Impact of saliency guidance on task selection accuracy
+- Contribution of different loss components (compression rate, task performance, selection accuracy)
+- Effect of encoder complexity on feature quality and compression performance
+- Comparison of different task selection mechanisms (early/late decision points)
+- Analysis of blueprint architecture components for different model families
+- Efficiency of conditional execution paths compared to full model execution
+
+** Expected Contributions
+
+1. A novel framework for task-aware supervised compression in edge computing
+2. Techniques for lightweight, early-layer task selection
+3. Joint optimization methods for compression, task performance, and task selection
+4. Empirical evaluation across diverse multi-task scenarios
+5. Guidelines for deployment in resource-constrained edge environments
+
+** Timeline and Milestones
+
+*** Phase 1: Framework Development 
+- Design task-aware supervised compression architecture
+- Implement baseline models and evaluation infrastructure
+- Develop initial task selection mechanisms
+
+*** Phase 2: Optimization and Refinement 
+- Refine joint optimization techniques
+- Implement hierarchical decision making
+- Incorporate uncertainty estimation
+
+*** Phase 3: Evaluation and Validation 
+- Comprehensive evaluation across datasets and tasks
+- Ablation studies to assess component contributions
+- Comparison with state-of-the-art approaches
+
+*** Phase 4: Documentation and Dissemination 
+- Prepare research papers for publication
+- Develop open-source implementation
+- Create deployment guidelines for practitioners
+
+** Conclusion
+
+This research addresses a critical gap in multi-task edge computing by developing task-aware supervised compression techniques. Building on recent advances in neural feature compression, particularly FrankenSplit's approach to shallow variational bottleneck injection, we propose a novel framework that enables efficient task selection directly from compressed feature representations.
+
+By integrating saliency-guided distortion mechanisms with task relevance classification, our approach enables edge devices to make informed decisions about which tasks to execute without requiring full decompression or extensive computation. This significantly reduces both computational and communication overhead while maintaining high task performance across diverse applications.
+
+The resource-asymmetry aware architecture, with its lightweight encoder and specialized decoder blueprints, ensures that our approach remains practical for real-world deployment on resource-constrained devices. By demonstrating that a single encoder can support multiple decoder-backbone pairs, we enable flexible multi-task execution without increasing client-side complexity.
+
+The resulting framework advances the state of the art in edge intelligence by combining the strengths of supervised compression with efficient task selection mechanisms. This enables new applications in resource-constrained environments where traditional approaches either consume excessive bandwidth (through offloading) or waste computational resources (by executing irrelevant tasks).
