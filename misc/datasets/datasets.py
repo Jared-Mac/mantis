@@ -5,16 +5,23 @@ from .registry import register_dataset_class # Assuming registry is in the same 
 
 @register_dataset_class
 class LabelChunkedTaskDataset(Dataset):
-    def __init__(self, original_dataset: Dataset, task_configs: list, 
-                 default_task_id: int = -1,
-                 default_task_label: int = -1):
+    def __init__(self, 
+                 original_dataset: Dataset, 
+                 task_configs: list, 
+                 default_task_id: int = -1, 
+                 default_task_specific_label: int = -1):
+
+        print(f"DEBUG: LabelChunkedTaskDataset received original_dataset of type: {type(original_dataset)}")
+        if not isinstance(original_dataset, Dataset):
+            print(f"DEBUG: ERROR - original_dataset is NOT a PyTorch Dataset instance!")
+
         self.original_dataset = original_dataset
         self.default_task_id = default_task_id
-        self.default_task_label = default_task_label
-        
+        self.default_task_specific_label = default_task_specific_label # Make sure this matches the parameter name
+
         self.processed_task_configs = []
         self.task_id_to_dense_idx_map = {} 
-        
+
         unique_task_ids_from_config = []
         for i, tc in enumerate(task_configs):
             if not all(k in tc for k in ['task_id', 'original_labels']):
@@ -22,8 +29,10 @@ class LabelChunkedTaskDataset(Dataset):
 
             task_id = tc['task_id']
             if task_id not in unique_task_ids_from_config:
-                 unique_task_ids_from_config.append(task_id)
+                unique_task_ids_from_config.append(task_id)
+
             current_one_hot_idx = unique_task_ids_from_config.index(task_id)
+            # Ensure the map uses the actual task_id from config as key
             self.task_id_to_dense_idx_map[task_id] = current_one_hot_idx
 
             original_labels_input = tc['original_labels']
@@ -36,13 +45,13 @@ class LabelChunkedTaskDataset(Dataset):
                 original_labels_set = set(original_labels_input)
             else:
                 raise TypeError(f"original_labels for task {task_id} must be a list or a dict like {{'range': [start, end]}}.")
-                        
+
             sorted_original_labels_for_task = sorted(list(original_labels_set))
             label_remapping = {
                 original_label_val: task_specific_idx 
                 for task_specific_idx, original_label_val in enumerate(sorted_original_labels_for_task)
             }
-            
+
             self.processed_task_configs.append({
                 'task_id': task_id,
                 'dense_idx': current_one_hot_idx,
@@ -50,37 +59,35 @@ class LabelChunkedTaskDataset(Dataset):
                 'label_remapping': label_remapping,
                 'num_classes_in_task': len(original_labels_set)
             })
-        
+
         self.num_defined_tasks = len(unique_task_ids_from_config)
         if self.num_defined_tasks == 0 and len(task_configs) > 0:
-            # This case should ideally be caught by the task_id check, but good to have
             print("Warning: Task configs provided but resulted in zero distinct tasks for the detector.")
-
 
     def __getitem__(self, index: int):
         image, original_label = self.original_dataset[index] 
-        
+
         if isinstance(original_label, torch.Tensor):
             original_label = original_label.item()
 
-        assigned_task_id_val = self.default_task_id
-        task_specific_label_for_main_task = torch.tensor(self.default_task_label, dtype=torch.long)
-        
+        assigned_task_id_val = self.default_task_id 
+        task_specific_label_for_main_task = torch.tensor(self.default_task_specific_label, dtype=torch.long)
+
         task_detector_target = torch.zeros(self.num_defined_tasks, dtype=torch.float32)
-        
+
         matched_dense_idx = -1
 
         for config in self.processed_task_configs:
             if original_label in config['original_labels_set']:
                 assigned_task_id_val = config['task_id']
                 task_specific_label_for_main_task = torch.tensor(config['label_remapping'][original_label], dtype=torch.long)
-                matched_dense_idx = config['dense_idx']
+                matched_dense_idx = config['dense_idx'] # Use the stored dense_idx
                 if 0 <= matched_dense_idx < self.num_defined_tasks:
                     task_detector_target[matched_dense_idx] = 1.0
                 break 
-        
+
         targets_for_loss = (task_specific_label_for_main_task, task_detector_target)
-        
+
         return image, targets_for_loss, original_label, assigned_task_id_val
 
     def __len__(self) -> int:

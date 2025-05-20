@@ -226,7 +226,7 @@ class SplittableImageSegmentatorWithCompressionModule(NetworkWithCompressionModu
 class SplittableNetworkWithSharedStem(NetworkWithCompressionModule): 
     def __init__(self,
                  shared_stem_config,
-                 task_probability_model_config, # Added
+                 task_probability_model_config, 
                  compression_module_config,
                  backbone_config,
                  reconstruction_layer_for_backbone_config=None,
@@ -327,58 +327,151 @@ class SplittableNetworkWithSharedStem(NetworkWithCompressionModule):
             return {"main_output": main_task_output, 
                     "conditioning_signal_preview": conditioning_signal} # Or actual task probabilities
         return main_task_output
-    
-@register_model_func
-def splittable_network_with_compressor(compression_module_config,
-                                       backbone_module_config=None,
-                                       analysis_config=None,
-                                       reconstruction_layer_config=None,
-                                       tokenize_compression_output=False,
-                                       network_type="SplittableSwinTransformer"):
-    compression_module = get_custom_compression_module(compression_module_config["name"],
-                                                       **compression_module_config["params"])
-    if reconstruction_layer_config:
-        reconstruction_layer = get_layer(reconstruction_layer_config["name"],
-                                         **reconstruction_layer_config.get("params", dict()))
-    else:
-        reconstruction_layer = nn.Identity()
 
-    if backbone_module_config:
-        backbone_module = get_model(model_name=backbone_module_config["name"], **backbone_module_config["params"])
-    else:
-        logger.info("Backbone is identity function..")
-        backbone_module = nn.Identity()
-    network = get_model(model_name=network_type,
-                        compressor=compression_module,
-                        reconstruction_layer=reconstruction_layer,
-                        backbone=backbone_module,
-                        analysis_config=analysis_config,
-                        tokenize_compression_output=tokenize_compression_output)
+@register_model_class 
+class FiLMedNetworkWithSharedStem(NetworkWithCompressionModule):
+    def __init__(self,
+                 shared_stem_config,
+                 task_probability_model_config,
+                 compression_module_config,     
+                 backbone_config,
+                 reconstruction_layer_for_backbone_config=None,
+                 analysis_config_parent=None):
+        
+        # Step A: Instantiate components needed to determine parameters for compressor/backbone
+        # Create them as local variables first if their attributes are needed before super().__init__
+        _shared_stem_temp = SharedInputStem(**shared_stem_config["params"])
+        stem_output_channels = _shared_stem_temp.get_output_channels()
+
+        actual_task_prob_model_config_params = task_probability_model_config["params"].copy()
+        actual_task_prob_model_config_params["input_channels_from_stem"] = stem_output_channels
+        _task_probability_model_temp = TaskProbabilityModel(**actual_task_prob_model_config_params)
+        expected_film_cond_dim = _task_probability_model_temp.get_output_dim()
+        
+        # Step B: Prepare full analysis_config for the compression_module's g_a
+        # (This g_a is TaskConditionedFiLMedAnalysisNetwork)
+        actual_analysis_config_for_g_a = compression_module_config["params"]["analysis_config"]
+        actual_analysis_config_for_g_a["params"]["input_channels_from_stem"] = stem_output_channels
+        
+        if "film_cond_dim" not in actual_analysis_config_for_g_a["params"] or \
+           actual_analysis_config_for_g_a["params"]["film_cond_dim"] is None:
+            logger.info(f"Setting/Overriding film_cond_dim in analysis_config for g_a from TaskProbabilityModel output_dim: {expected_film_cond_dim}")
+            actual_analysis_config_for_g_a["params"]["film_cond_dim"] = expected_film_cond_dim
+        elif actual_analysis_config_for_g_a["params"]["film_cond_dim"] != expected_film_cond_dim:
+            raise ValueError(
+                f"film_cond_dim in analysis_config for g_a ({actual_analysis_config_for_g_a['params']['film_cond_dim']}) "
+                f"must match output_cond_signal_dim of task_probability_model ({expected_film_cond_dim})."
+            )
+
+        # Step C: Instantiate compressor and backbone (as local variables)
+        # These are needed for the super().__init__() call of NetworkWithCompressionModule
+        compressor_instance = get_custom_compression_module(
+            compression_module_config["name"],
+            **compression_module_config["params"] 
+        )
+        backbone_instance = get_model(model_name=backbone_config["name"], **backbone_config["params"])
+
+        # Step D: Call super().__init__() for NetworkWithCompressionModule FIRST.
+        # This will call AnalyzableModule.__init__(), which calls nn.Module.__init__().
+        # Pass the already instantiated compressor and backbone.
+        super().__init__(compressor_instance, backbone_instance, analysis_config=analysis_config_parent)
+
+        # Step E: Now it's safe to assign other nn.Module attributes to self.
+        # Assign the temporarily created modules to self.
+        self.shared_stem = _shared_stem_temp
+        self.task_probability_model = _task_probability_model_temp
+        
+        # Handle reconstruction_layer_for_backbone_config
+        if reconstruction_layer_for_backbone_config and reconstruction_layer_for_backbone_config.get("name"):
+            # This get_layer returns an nn.Module instance
+            reconstruction_layer_instance = get_layer(
+                reconstruction_layer_for_backbone_config["name"],
+                **reconstruction_layer_for_backbone_config.get("params", {})
+            )
+            # self.compression_module is available now (set by super().__init__)
+            if hasattr(self.compression_module.g_s, 'final_layer'):
+                logger.info(f"Setting final_layer of g_s to {reconstruction_layer_for_backbone_config['name']}")
+                self.compression_module.g_s.final_layer = reconstruction_layer_instance
+                # If it's part of g_s, self.reconstruction_for_backbone can be Identity or not used in forward
+                self.reconstruction_for_backbone = nn.Identity() 
+            else: 
+                # If g_s doesn't have a final_layer attribute, assign it here to be applied in forward
+                self.reconstruction_for_backbone = reconstruction_layer_instance
+        else:
+            self.reconstruction_for_backbone = nn.Identity()
+
+    def forward(self, x, targets=None):
+        # ... (rest of your forward method as previously defined)
+        stem_features = self.shared_stem(x)
+        conditioning_signal = self.task_probability_model(stem_features) 
+        
+        reconstructed_features_from_compressor_output = self.compression_module(stem_features, conditioning_signal=conditioning_signal)
+        
+        # Handle if compressor returns tuple (features, likelihoods)
+        if isinstance(reconstructed_features_from_compressor_output, tuple) and \
+           len(reconstructed_features_from_compressor_output) > 0 and \
+           isinstance(reconstructed_features_from_compressor_output[0], torch.Tensor):
+            reconstructed_features = reconstructed_features_from_compressor_output[0]
+        else:
+            reconstructed_features = reconstructed_features_from_compressor_output
+           
+        features_for_backbone = reconstructed_features
+        # Apply self.reconstruction_for_backbone only if it's a real module and not already part of g_s
+        if not isinstance(self.reconstruction_for_backbone, nn.Identity) and \
+           not (hasattr(self.compression_module.g_s, 'final_layer') and \
+                isinstance(self.compression_module.g_s.final_layer, type(self.reconstruction_for_backbone))):
+            features_for_backbone = self.reconstruction_for_backbone(reconstructed_features)
+            
+        main_task_output = self.backbone(self.tokenizer(features_for_backbone)) 
+           
+        if self.training:
+            return {"main_output": main_task_output, 
+                    "conditioning_signal_preview": conditioning_signal} 
+        return main_task_output
+@register_model_func 
+def splittable_network_with_compressor_with_shared_stem(
+    shared_stem_config,
+    task_probability_model_config, 
+    compression_module_config,
+    backbone_config,               
+    reconstruction_layer_for_backbone_config=None,
+    analysis_config_parent=None,    
+    network_type="FiLMedNetworkWithSharedStem" # <<< UPDATED DEFAULT CLASS NAME
+):
+    network = get_model( 
+        model_name=network_type, # Uses the (potentially overridden by YAML) network_type
+        shared_stem_config=shared_stem_config,
+        task_probability_model_config=task_probability_model_config,
+        compression_module_config=compression_module_config,
+        backbone_config=backbone_config, 
+        reconstruction_layer_for_backbone_config=reconstruction_layer_for_backbone_config,
+        analysis_config_parent=analysis_config_parent 
+    )
     return network
 @register_model_func
 def splittable_network_with_compressor_with_shared_stem(
     shared_stem_config,                       # New
-    # task_probability_model_config,          # New (for later)
+    task_probability_model_config,          # New (for later)
     compression_module_config,
-    backbone_module_config,
+    backbone_config,
     reconstruction_layer_for_backbone_config=None, # New/Renamed
-    analysis_config=None, # This is for the parent NetworkWithCompressionModule
-    network_type="FrankensplitNetworkWithSharedStem" # Use your new class
+    analysis_config_parent=None, # This is for the parent NetworkWithCompressionModule
+    network_type="FiLMedHFactorizedPriorCompressionModule" # Use your new class
 ):
     # The actual analysis_config (for g_a) is inside compression_module_config
     # We will let FrankensplitNetworkWithSharedStem handle setting input_channels_from_stem
     
-    network = get_model(
-        model_name=network_type,
+    # This will call FrankensplitNetworkWithSharedStem.__init__ via the registry
+    network = get_model( 
+        model_name=network_type, # Should be "FrankensplitNetworkWithSharedStem"
         shared_stem_config=shared_stem_config,
-        # task_probability_model_config=task_probability_model_config,
+        task_probability_model_config=task_probability_model_config, # Now correctly passed
         compression_module_config=compression_module_config,
-        backbone_config=backbone_module_config,
+        backbone_config=backbone_config,
         reconstruction_layer_for_backbone_config=reconstruction_layer_for_backbone_config,
-        analysis_config_parent=analysis_config
+        analysis_config_parent=analysis_config_parent 
     )
     return network
-
 @register_model_func
 def get_compression_model(compression_module_config):
     return get_custom_compression_module(compression_module_config["name"], **compression_module_config["params"])

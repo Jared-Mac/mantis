@@ -861,7 +861,7 @@ class RecursiveMeanScaleHyperprior(CompressionModule):
         medians = self.entropy_bottleneck._extend_ndims(medians, spatial_dims)
         medians = medians.expand(x.size(0), *([-1] * (spatial_dims + 1)))
         return medians
-
+@register_custom_compression_module
 class FiLMedHFactorizedPriorCompressionModule(FactorizedPriorModule):
     def __init__(self,
                  entropy_bottleneck_channels,
