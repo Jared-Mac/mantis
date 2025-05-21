@@ -422,12 +422,25 @@ class FiLMedNetworkWithSharedStem(NetworkWithCompressionModule):
                 isinstance(self.compression_module.g_s.final_layer, type(self.reconstruction_for_backbone))):
             features_for_backbone = self.reconstruction_for_backbone(reconstructed_features)
             
-        main_task_output = self.backbone(self.tokenizer(features_for_backbone)) 
+        # Pass conditioning_signal to the backbone.
+        # MultiTailResNetBackbone expects feature maps, so self.tokenizer is likely not needed
+        # if features_for_backbone is already in the correct (feature map) format.
+        backbone_outputs_dict = self.backbone(features_for_backbone, conditioning_signal) 
            
         if self.training:
-            return {"main_output": main_task_output, 
-                    "conditioning_signal_preview": conditioning_signal} 
-        return main_task_output
+            # Return the dictionary from the backbone directly, and include the conditioning signal
+            # for the loss function and metrics.
+            return {
+                "backbone_outputs": backbone_outputs_dict, # e.g., {'tail_0': ..., 'tail_1': ...}
+                "conditioning_signal": conditioning_signal # e.g., task logits/probabilities
+            }
+        else:
+            # For inference, also return the full set of outputs.
+            # The evaluation logic will need to know which tail's output to use based on the context or conditioning_signal.
+            return {
+                "backbone_outputs": backbone_outputs_dict,
+                "conditioning_signal": conditioning_signal
+            }
 @register_model_func 
 def splittable_network_with_compressor_with_shared_stem(
     shared_stem_config,

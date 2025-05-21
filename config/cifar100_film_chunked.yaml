@@ -1,0 +1,157 @@
+datasets:
+  name: cifar100_chunked_film
+  type: LabelChunkedTaskDataset # To be loaded by a custom dataset getter
+  dataset_id: &cifar100_chunked_train cifar100_chunked_train
+  val_dataset_id: &cifar100_chunked_val cifar100_chunked_val
+  root: './data/cifar100' # Standard CIFAR-100 path
+  download: true
+  task_configs:
+    - task_id: 0
+      original_labels: { range: [0, 50] } # Classes 0-49
+      num_classes: 50
+    - task_id: 1
+      original_labels: { range: [50, 100] } # Classes 50-99
+      num_classes: 50
+  train_transform: # Standard CIFAR-100 transforms
+    - type: Resize
+      params:
+        size: [32, 32] # Or desired input size for the model
+    - type: RandomCrop
+      params:
+        size: [32, 32]
+        padding: 4
+    - type: RandomHorizontalFlip
+      params:
+        p: 0.5
+    - type: ToTensor
+      params: {}
+    - type: Normalize
+      params:
+        mean: [0.5071, 0.4867, 0.4408]
+        std: [0.2675, 0.2565, 0.2761]
+  val_transform: # Standard CIFAR-100 transforms
+    - type: Resize
+      params:
+        size: [32, 32]
+    - type: ToTensor
+      params: {}
+    - type: Normalize
+      params:
+        mean: [0.5071, 0.4867, 0.4408]
+        std: [0.2675, 0.2565, 0.2761]
+  train_data_loader:
+    dataset_id: *cifar100_chunked_train
+    batch_size: 128
+    shuffle: true
+    num_workers: 4
+    pin_memory: true
+  val_data_loader:
+    dataset_id: *cifar100_chunked_val
+    batch_size: 128
+    shuffle: false
+    num_workers: 4
+    pin_memory: true
+  org_dataset_configs: # Configuration for the underlying CIFAR100 dataset
+    cifar100_train:
+      type: CIFAR100
+      params:
+        root: './data/cifar100'
+        train: true
+        download: true
+        transform_params: # Will be picked up by the dataset utility
+          -Resize: { size: [32,32] }
+          -RandomCrop: { size: [32,32], padding: 4 }
+          -RandomHorizontalFlip: { p: 0.5 }
+          -ToTensor: {}
+          -Normalize: { mean: [0.5071, 0.4867, 0.4408], std: [0.2675, 0.2565, 0.2761] }
+    cifar100_val:
+      type: CIFAR100
+      params:
+        root: './data/cifar100'
+        train: false
+        download: true
+        transform_params:
+          -Resize: { size: [32,32] }
+          -ToTensor: {}
+          -Normalize: { mean: [0.5071, 0.4867, 0.4408], std: [0.2675, 0.2565, 0.2761] }
+
+models:
+  student_model: # Or just 'model' if not using distillation setup from main_classification_torchdistill
+    name: FiLMedNetworkWithSharedStem # Or a new custom model name if step 3 leads to it
+    network_type: FiLMedNetworkWithSharedStem # Explicitly state the class to be used by registry
+    params:
+      shared_stem_config:
+        name: ConvStem # A generic conv stem, replace with actual name if different
+        params:
+          input_channels: 3
+          output_channels: 64 # Example
+          # ... other stem params (kernel_size, stride, etc.)
+      task_probability_model_config:
+        name: TaskProbabilityModel # From model/modules/task_predictors.py
+        params:
+          input_channels_from_stem: 64 # Should match shared_stem output_channels
+          num_tasks: 2 # For two chunks
+          # ... other params for TaskProbabilityModel (e.g., hidden layers)
+      compression_module_config: # This is where the FiLM encoder (g_a) is configured
+        name: FiLMedHFactorizedPriorCompressionModule # Example name, ensure it exists
+        params:
+          # ... params for the compression module itself (latents, etc.)
+          analysis_config: # Config for the g_a (FiLMed analysis transform)
+            name: TaskConditionedFiLMedAnalysisNetwork # Example, ensure this is the correct g_a type
+            params:
+              input_channels_from_stem: 64 # Match shared_stem output
+              film_cond_dim: 2 # Match task_probability_model_config output_dim (e.g., num_tasks for logits)
+              # ... other g_a parameters (num_filters, num_levels, etc.)
+          synthesis_config: # Config for g_s
+            name: TaskConditionedSynthesisNetwork # Example name
+            params:
+              # ... g_s parameters
+          hyper_analysis_config: # Config for h_a
+            name: HyperAnalysisNetwork # Example name
+            params:
+              # ... h_a parameters
+          hyper_synthesis_config: # Config for h_s
+            name: HyperSynthesisNetwork # Example name
+            params:
+              # ... h_s parameters
+      backbone_config: # This is for the main task decoder(s)
+        name: MultiTailResNetBackbone # Placeholder: this will likely be a custom module
+        params:
+          input_features_dim: <dimension_from_gs_output> # Dimension from synthesis transform output
+          num_tails: 2
+          per_tail_output_classes: 50
+          # ... other backbone parameters (e.g., block types, num_blocks)
+      reconstruction_layer_for_backbone_config: # Adapts g_s output to backbone input if needed
+        name: Identity # Or a specific projection layer
+        params: {}
+      analysis_config_parent: {} # For NetworkWithCompressionModule's own analyzers
+
+train:
+  log_freq: 100
+  num_epochs: 100 # Example
+  optimizer:
+    type: AdamW
+    params:
+      lr: 0.001
+      weight_decay: 0.0001
+  lr_scheduler:
+    type: MultiStepLR
+    params:
+      milestones: [50, 75]
+      gamma: 0.1
+  criterion:
+    type: ChunkedCrossEntropyLoss # Placeholder for a custom loss
+    params:
+      num_chunks: 2
+  eval_metrics: # Metrics for each stage/overall
+    - accuracy_chunk0: {type: AccuracyForChunk, params: {chunk_id: 0}} # Placeholder
+    - accuracy_chunk1: {type: AccuracyForChunk, params: {chunk_id: 1}} # Placeholder
+    - task_accuracy: {type: TaskPredictionAccuracy} # Placeholder for task prob model
+
+test: # Similar metrics for test phase
+  eval_metrics:
+    - accuracy_chunk0: {type: AccuracyForChunk, params: {chunk_id: 0}}
+    - accuracy_chunk1: {type: AccuracyForChunk, params: {chunk_id: 1}}
+    - task_accuracy: {type: TaskPredictionAccuracy}
+  test_data_loader: # Which val loader to use for testing
+    dataset_id: *cifar100_chunked_val

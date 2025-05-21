@@ -347,3 +347,82 @@ class IndexedSimpleLossWrapper(nn.Module):
 
     def __str__(self):
         return self.single_loss.__str__()
+
+
+class ChunkedCrossEntropyLoss(nn.Module):
+    def __init__(self, num_chunks, task_loss_weight=1.0, chunk_loss_weight=1.0, label_smoothing=0.0):
+        super().__init__()
+        self.num_chunks = num_chunks
+        self.task_loss_weight = task_loss_weight
+        self.chunk_loss_weight = chunk_loss_weight
+        
+        # Loss for the TaskProbabilityModel (predicting the chunk)
+        # conditioning_signal (logits) vs task_detector_target (one-hot)
+        # Using CrossEntropyLoss, so task_detector_target needs to be converted to class indices
+        self.task_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        
+        # Loss for the main classification task within each chunk
+        self.chunk_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+
+    def forward(self, model_output, targets):
+        # model_output: dict from FiLMedNetworkWithSharedStem:
+        #   {
+        #     "backbone_outputs": {'tail_0': tensor, 'tail_1': tensor, ...}, # Logits for each tail
+        #     "conditioning_signal": tensor # Logits from TaskProbabilityModel
+        #   }
+        # targets: tuple from LabelChunkedTaskDataset:
+        #   (
+        #     task_specific_label, # (batch_size), remapped labels for the specific chunk
+        #     task_detector_target   # (batch_size, num_chunks), one-hot, indicates true chunk
+        #   )
+
+        backbone_outputs = model_output["backbone_outputs"] # Dict of tail outputs
+        conditioning_signal = model_output["conditioning_signal"] # Logits for task prediction
+
+        task_specific_labels = targets[0]
+        task_detector_targets_one_hot = targets[1] # (batch_size, num_chunks)
+
+        # 1. Calculate loss for the TaskProbabilityModel
+        # Convert one-hot task_detector_targets to class indices for CrossEntropyLoss
+        true_task_indices = torch.argmax(task_detector_targets_one_hot, dim=1)
+        task_loss = self.task_criterion(conditioning_signal, true_task_indices)
+        
+        # 2. Calculate classification loss for the active chunk(s)
+        total_chunk_loss = 0.0
+        samples_processed_for_chunk_loss = 0
+
+        for i in range(self.num_chunks):
+            # Get mask for samples belonging to chunk 'i'
+            chunk_mask = (true_task_indices == i) # (batch_size)
+            
+            if chunk_mask.sum() > 0:
+                # Select outputs from the i-th tail for these samples
+                current_tail_output = backbone_outputs[f'tail_{i}'] # (batch_size, num_classes_per_chunk)
+                
+                # Filter outputs and labels for this chunk
+                chunk_outputs = current_tail_output[chunk_mask] # (num_samples_in_chunk_i, num_classes_per_chunk)
+                chunk_labels = task_specific_labels[chunk_mask]   # (num_samples_in_chunk_i)
+                
+                if chunk_outputs.nelement() > 0 and chunk_labels.nelement() > 0:
+                    loss_for_chunk = self.chunk_criterion(chunk_outputs, chunk_labels)
+                    total_chunk_loss += loss_for_chunk * chunk_outputs.size(0) # Weight by actual samples
+                    samples_processed_for_chunk_loss += chunk_outputs.size(0)
+                elif chunk_outputs.nelement() == 0 and chunk_labels.nelement() > 0:
+                    # This case should ideally not happen if mask is correct
+                    # logger.warning(f"Warning: No outputs for chunk {i} but labels exist.")
+                    pass
+                elif chunk_outputs.nelement() > 0 and chunk_labels.nelement() == 0:
+                    # This case should ideally not happen
+                    # logger.warning(f"Warning: Outputs for chunk {i} but no labels exist.")
+                    pass
+
+        if samples_processed_for_chunk_loss > 0:
+            average_chunk_loss = total_chunk_loss / samples_processed_for_chunk_loss
+        else:
+            average_chunk_loss = torch.tensor(0.0, device=conditioning_signal.device, requires_grad=True)
+
+        # 3. Combine losses
+        combined_loss = (self.task_loss_weight * task_loss) + \
+                        (self.chunk_loss_weight * average_chunk_loss)
+        
+        return combined_loss
