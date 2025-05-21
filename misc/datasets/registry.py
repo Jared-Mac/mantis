@@ -1,4 +1,6 @@
 # model/datasets/registry.py
+import torch # Added for torch.load
+import os # Potentially for path joining if needed, but torch.load handles paths
 from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision import datasets as torchvision_datasets # For easier access
@@ -52,8 +54,47 @@ def get_dataset(config: dict) -> Dataset:
     if dataset_type is None:
         raise ValueError(f"Dataset configuration must include a 'type' field. Config: {config}")
 
-    dataset_params_config = config.get('params', {}) # Original params from YAML for this level
+    dataset_params_config = config.get('params', {}).copy() # Use .copy() to allow popping
     
+    # First, parse any transforms specified, as they might be needed by WrappedTinyDataset
+    # This logic is similar to what's done later, but we need transform object early if tiny is used.
+    # We store it in a temp variable and then put it into processed_constructor_params.
+    
+    _parsed_transform = None
+    if 'transform' in dataset_params_config and isinstance(dataset_params_config['transform'], dict) and \
+       '_target_' in dataset_params_config['transform'] and 'config' in dataset_params_config['transform']:
+        transform_list_config = dataset_params_config['transform'].get('config', [])
+        _parsed_transform = parse_transform_config_list(transform_list_config)
+    elif 'transform_params' in dataset_params_config and isinstance(dataset_params_config['transform_params'], list):
+        _parsed_transform = parse_transform_config_list(dataset_params_config['transform_params'])
+
+    # Handle tiny dataset loading if specified
+    tiny_version_path = dataset_params_config.pop('use_tiny_version_path', None)
+    if tiny_version_path:
+        print(f"INFO: Loading tiny dataset version from: {tiny_version_path}")
+        if not os.path.exists(tiny_version_path):
+            raise FileNotFoundError(f"Tiny dataset file not found: {tiny_version_path}. Please run the creation script.")
+        
+        loaded_data = torch.load(tiny_version_path) # Should be a list of (PIL Image, label)
+
+        # Define a local wrapper dataset for the tiny data
+        class WrappedTinyDataset(Dataset):
+            def __init__(self, data, transform=None):
+                self.data = data # List of (image, label)
+                self.transform = transform
+
+            def __len__(self):
+                return len(self.data)
+
+            def __getitem__(self, idx):
+                image, label = self.data[idx]
+                if self.transform:
+                    image = self.transform(image)
+                return image, label
+        
+        # Use the already parsed transform
+        return WrappedTinyDataset(loaded_data, transform=_parsed_transform)
+
     processed_constructor_params = {}
     for key, value in dataset_params_config.items():
         if key == 'original_dataset' and isinstance(value, dict) and 'type' in value:
@@ -70,14 +111,23 @@ def get_dataset(config: dict) -> Dataset:
         elif key == 'transform' and isinstance(value, dict) and '_target_' in value and 'config' in value:
             # Handle the specific transform structure: {'_target_': ..., 'config': [list_of_transform_dicts]}
             # Assuming 'config' key holds the list of transform parameters
-            print(f"DEBUG: Parsing transform config for key '{key}'")
-            transform_list_config = value.get('config', [])
-            processed_constructor_params[key] = parse_transform_config_list(transform_list_config)
-        elif key == 'transform_params' and isinstance(value, list): # Legacy or direct list of transform configs
-            print(f"DEBUG: Parsing transform_params list directly for key '{key}'")
-            processed_constructor_params['transform'] = parse_transform_config_list(value) # Store as 'transform'
-        else:
-            processed_constructor_params[key] = value
+            # This was handled above for _parsed_transform, now assign if not tiny
+            if key == 'transform' and _parsed_transform is not None:
+                 processed_constructor_params[key] = _parsed_transform
+            elif key == 'transform_params' and _parsed_transform is not None:
+                 processed_constructor_params['transform'] = _parsed_transform # Store as 'transform'
+            # Ensure original_dataset or named_datasets don't re-process transform if already done
+            elif key not in ['transform', 'transform_params']:
+                 processed_constructor_params[key] = value
+            elif _parsed_transform is None: # If transform wasn't processed above and key is transform/transform_params
+                 if key == 'transform' and isinstance(value, dict) and '_target_' in value and 'config' in value:
+                    transform_list_config = value.get('config', [])
+                    processed_constructor_params[key] = parse_transform_config_list(transform_list_config)
+                 elif key == 'transform_params' and isinstance(value, list):
+                    processed_constructor_params['transform'] = parse_transform_config_list(value)
+                 else:
+                    processed_constructor_params[key] = value
+
 
     # After processing all params:
     if dataset_type in DATASET_CLASS_DICT:

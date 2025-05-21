@@ -13,13 +13,18 @@ from torchdistill.common import file_util, yaml_util, module_util
 from torchdistill.common.constant import def_logger
 from torchdistill.common.main_util import is_main_process, init_distributed_mode, load_ckpt, save_ckpt, set_seed
 from torchdistill.common.module_util import check_if_wrapped
-from torchdistill.core.distillation import MultiStagesDistillationBox, get_distillation_box
+from torchdistill.core.distillation import MultiStagesDistillationBox, get_distillation_box, DistillationBox
 from torchdistill.core.forward_proc import get_forward_proc_func
-from torchdistill.core.training import MultiStagesTrainingBox, get_training_box
+from torchdistill.core.training import MultiStagesTrainingBox, get_training_box, TrainingBox
 from torchdistill.core.util import set_hooks
-from torchdistill.datasets import util
+from torchdistill.datasets import util as distill_util # Aliasing for clarity in fallback
+from torchdistill.optim.optimizer import get_optimizer
+from torchdistill.optim.scheduler import get_scheduler
+from misc.loss import ChunkedCrossEntropyLoss
 from pathlib import Path
 
+from misc.datasets.registry import get_dataset as get_custom_dataset
+from misc.datasets.registry import parse_transform_config_list
 from torchdistill.models.special import build_special_module
 from torchdistill.models.util import redesign_model
 from torchvision import datasets
@@ -92,21 +97,83 @@ def train(teacher_model,
     train_config = config['train']
     log_freq = train_config['log_freq']
     lr_factor = args.world_size if distributed and args.adjust_lr else 1
-    training_box = get_training_box(student_model,
-                                    dataset_dict,
-                                    train_config,
-                                    device,
-                                    device_ids,
-                                    distributed,
-                                    lr_factor) if teacher_model is None or skip_teacher\
-        else get_distillation_box(teacher_model,
-                                  student_model,
-                                  dataset_dict,
-                                  train_config,
-                                  device,
-                                  device_ids,
-                                  distributed,
-                                  lr_factor)
+
+    criterion_config = train_config['criterion']
+    optimizer_config = train_config['optimizer']
+    scheduler_config = train_config.get('lr_scheduler', None)
+
+    if criterion_config['type'] == 'ChunkedCrossEntropyLoss':
+        logger.info(f"Using custom ChunkedCrossEntropyLoss.")
+        crit_params = criterion_config.get('params', {})
+        criterion = ChunkedCrossEntropyLoss(**crit_params)
+        
+        optimizer = get_optimizer(student_model, optimizer_config, lr_factor=lr_factor)
+        
+        if scheduler_config:
+            lr_scheduler = get_scheduler(optimizer, scheduler_config)
+        else:
+            lr_scheduler = None
+
+        if teacher_model is None or skip_teacher:
+            # Build train_data_loader for TrainingBox
+            train_data_loader_config = train_config['train_data_loader']
+            train_data_loader = distill_util.build_data_loader(
+                dataset_dict[train_data_loader_config['dataset_id']],
+                train_data_loader_config,
+                distributed
+            )
+            
+            # Build val_data_loader for TrainingBox (needed for its internal structure, though eval is separate)
+            # It might also be used by some hooks or callbacks if any are registered with TrainingBox directly.
+            val_data_loader_config = train_config.get('val_data_loader', None)
+            if val_data_loader_config:
+                 val_data_loader = distill_util.build_data_loader(
+                    dataset_dict[val_data_loader_config['dataset_id']],
+                    val_data_loader_config,
+                    distributed
+                )
+            else: # Fallback if not specified, though typically it is.
+                val_data_loader = None
+
+
+            training_box = TrainingBox(
+                model=student_model,
+                train_data_loader=train_data_loader,
+                val_data_loader=val_data_loader, # Pass val_loader to TrainingBox
+                criterion=criterion,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                device=device,
+                device_ids=device_ids,
+                distributed=distributed,
+                log_freq=log_freq, # Pass log_freq
+                grad_accum_steps=train_config.get('grad_accum_steps', 1),
+                requires_supp=train_config.get('requires_supp', False),
+                ckpt_file_path=ckpt_file_path # Pass ckpt_file_path for potential internal use by TrainingBox
+            )
+            # Set num_epochs for TrainingBox if it's not inferred from data_loader
+            if 'num_epochs' in train_config:
+                training_box.num_epochs = train_config['num_epochs']
+
+        else:
+            logger.warning("ChunkedCrossEntropyLoss with DistillationBox is not fully supported via this custom path. Falling back to default torchdistill.get_distillation_box.")
+            training_box = get_distillation_box(
+                teacher_model, student_model, dataset_dict, train_config,
+                device, device_ids, distributed, lr_factor
+            )
+    else:
+        logger.info(f"Using default criterion type: {criterion_config['type']}")
+        if teacher_model is None or skip_teacher:
+            training_box = get_training_box(
+                student_model, dataset_dict, train_config, device,
+                device_ids, distributed, lr_factor
+            )
+        else:
+            training_box = get_distillation_box(
+                teacher_model, student_model, dataset_dict, train_config,
+                device, device_ids, distributed, lr_factor
+            )
+
     optimizer, lr_scheduler = training_box.optimizer, training_box.lr_scheduler
     student_model_without_ddp = student_model.module if module_util.check_if_wrapped(student_model) else student_model
     if args.pre_eval:
@@ -326,7 +393,77 @@ def train_main(args):
     else:
         ckpt_file_path = student_model_config['ckpt']
         skip_teacher = False
-    dataset_dict = util.get_all_datasets(datasets_config)
+  
+  # Custom dataset loading logic
+  dataset_dict = {}
+  if datasets_config.get('type') == 'LabelChunkedTaskDataset':
+      logger.info("Using custom loading path for LabelChunkedTaskDataset.")
+      
+      task_configs = datasets_config.get('task_configs', [])
+      shared_params = datasets_config.get('params', {}) # Params for LabelChunkedTaskDataset itself
+
+      # 1. Load original CIFAR100 train dataset
+      cifar100_train_config = datasets_config['org_dataset_configs']['cifar100_train']
+      cifar100_train_params = cifar100_train_config.get('params', {}).copy()
+      cifar100_train_params['transform'] = parse_transform_config_list(datasets_config.get('train_transform'))
+      
+      original_train_dataset_config_for_custom_getter = {
+          'type': cifar100_train_config['type'],
+          'params': cifar100_train_params
+      }
+
+      # 2. Prepare config for LabelChunkedTaskDataset (train)
+      lcd_train_params = {
+          'original_dataset': original_train_dataset_config_for_custom_getter,
+          'task_configs': task_configs
+      }
+      lcd_train_params.update(shared_params) # Add default_task_id etc. if present in shared_params
+
+      lcd_train_config_for_custom_getter = {
+          'type': 'LabelChunkedTaskDataset',
+          'params': lcd_train_params
+      }
+
+      dataset_train_name = datasets_config.get('dataset_id') 
+      if not dataset_train_name:
+          raise ValueError("`dataset_id` must be specified in datasets_config for LabelChunkedTaskDataset.")
+      dataset_dict[dataset_train_name] = get_custom_dataset(lcd_train_config_for_custom_getter)
+      logger.info(f"Loaded training dataset '{dataset_train_name}' using LabelChunkedTaskDataset.")
+
+      # 3. Load original CIFAR100 val dataset
+      cifar100_val_config = datasets_config['org_dataset_configs']['cifar100_val']
+      cifar100_val_params = cifar100_val_config.get('params', {}).copy()
+      cifar100_val_params['transform'] = parse_transform_config_list(datasets_config.get('val_transform'))
+
+      original_val_dataset_config_for_custom_getter = {
+          'type': cifar100_val_config['type'],
+          'params': cifar100_val_params
+      }
+
+      # 4. Prepare config for LabelChunkedTaskDataset (val)
+      lcd_val_params = {
+          'original_dataset': original_val_dataset_config_for_custom_getter,
+          'task_configs': task_configs
+      }
+      lcd_val_params.update(shared_params) # Add default_task_id etc. if present in shared_params
+
+      lcd_val_config_for_custom_getter = {
+          'type': 'LabelChunkedTaskDataset',
+          'params': lcd_val_params
+      }
+      
+      dataset_val_name = datasets_config.get('val_dataset_id')
+      if not dataset_val_name:
+          raise ValueError("`val_dataset_id` must be specified in datasets_config for LabelChunkedTaskDataset.")
+      dataset_dict[dataset_val_name] = get_custom_dataset(lcd_val_config_for_custom_getter)
+      logger.info(f"Loaded validation dataset '{dataset_val_name}' using LabelChunkedTaskDataset.")
+
+  else:
+      logger.info("Using torchdistill default dataset loading path.")
+      # Fallback to existing torchdistill dataset loading
+      # The import 'from torchdistill.datasets import util as distill_util' was added at the top
+      dataset_dict = distill_util.get_all_datasets(datasets_config)
+
     if not args.test_only:
         train_config = config.get("train")
         stages = get_no_stages(train_config)
@@ -365,7 +502,8 @@ def train_main(args):
 
     test_config = config['test']
     test_data_loader_config = test_config['test_data_loader']
-    test_data_loader = util.build_data_loader(dataset_dict[test_data_loader_config['dataset_id']],
+  # Use distill_util here as well, as build_data_loader is part of torchdistill's dataset utils
+  test_data_loader = distill_util.build_data_loader(dataset_dict[test_data_loader_config['dataset_id']],
                                                   test_data_loader_config, distributed)
     log_freq = test_config.get('log_freq', 1000)
     eval_teacher = not args.student_only and teacher_model is not None

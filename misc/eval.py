@@ -275,10 +275,172 @@ EVAL_METRIC_DICT = {
                                               )
 }
 
+# Registry for new stateful metric classes
+_EVAL_METRIC_NAME_CLASS_DICT = dict()
 
-def get_eval_metric(metric_name, **kwargs) -> EvaluationMetric:
-    if metric_name not in EVAL_METRIC_DICT:
-        raise ValueError("Evaluation metric with name `{}` not registered".format(metric_name))
-    return EVAL_METRIC_DICT[metric_name]
+def register_eval_metric_class(cls):
+    metric_name = cls.__name__
+    if metric_name in _EVAL_METRIC_NAME_CLASS_DICT:
+        logger.warning(f"Evaluation metric class {metric_name} already registered. Overwriting.")
+    _EVAL_METRIC_NAME_CLASS_DICT[metric_name] = cls
+    return cls
+
+@register_eval_metric_class
+class TaskPredictionAccuracy:
+    def __init__(self):
+        self.correct = 0
+        self.total = 0
+        self.name = 'task_pred_acc'
+
+    def update(self, model_output, targets):
+        conditioning_signal = model_output["conditioning_signal"]
+        task_detector_targets_one_hot = targets[1]
+
+        predicted_task_indices = torch.argmax(conditioning_signal, dim=1)
+        true_task_indices = torch.argmax(task_detector_targets_one_hot, dim=1)
+        
+        self.correct += (predicted_task_indices == true_task_indices).sum().item()
+        self.total += task_detector_targets_one_hot.size(0)
+
+    def compute(self):
+        if self.total == 0:
+            return 0.0
+        return self.correct / self.total
+
+    def reset(self):
+        self.correct = 0
+        self.total = 0
+
+    def get_metric_dict(self):
+        return {self.name: self.compute()}
+
+    # Make it behave somewhat like EvaluationMetric for the existing loop if needed for transition
+    # This eval_func would be called by the existing loop in main_classification_torchdistill.py
+    # It would need to run a full evaluation pass.
+    def eval_func(self, model, data_loader, device, **kwargs):
+        self.reset()
+        model.eval()
+        with torch.no_grad():
+            for image, target_tuple in data_loader: # Assuming target_tuple is (task_specific_label, task_detector_target_one_hot)
+                image = image.to(device, non_blocking=True)
+                # Ensure targets are also moved to device if they are tensors
+                processed_targets = []
+                for t_item in target_tuple:
+                    if isinstance(t_item, torch.Tensor):
+                        processed_targets.append(t_item.to(device, non_blocking=True))
+                    else:
+                        processed_targets.append(t_item) # Keep non-tensors as is
+
+                model_output_dict = model(image) 
+                self.update(model_output_dict, tuple(processed_targets))
+        return self.compute()
+
+
+@register_eval_metric_class
+class AccuracyForChunk:
+    def __init__(self, chunk_id):
+        self.chunk_id = chunk_id
+        self.correct = 0
+        self.total = 0
+        self.name = f'acc_chunk_{chunk_id}'
+
+    def update(self, model_output, targets):
+        backbone_outputs = model_output["backbone_outputs"]
+        task_specific_labels = targets[0]
+        task_detector_targets_one_hot = targets[1]
+
+        true_task_indices = torch.argmax(task_detector_targets_one_hot, dim=1)
+        chunk_mask = (true_task_indices == self.chunk_id)
+        
+        if chunk_mask.sum().item() > 0:
+            current_tail_output = backbone_outputs.get(f'tail_{self.chunk_id}')
+            if current_tail_output is None:
+                logger.warning(f"Output for tail_{self.chunk_id} not found in backbone_outputs.")
+                return
+
+            chunk_logits = current_tail_output[chunk_mask]
+            chunk_true_labels = task_specific_labels[chunk_mask]
+            
+            if chunk_logits.nelement() > 0:
+                predicted_labels_for_chunk = torch.argmax(chunk_logits, dim=1)
+                self.correct += (predicted_labels_for_chunk == chunk_true_labels).sum().item()
+                self.total += chunk_true_labels.size(0)
+
+    def compute(self):
+        if self.total == 0:
+            return 0.0
+        return self.correct / self.total
+
+    def reset(self):
+        self.correct = 0
+        self.total = 0
+    
+    def get_metric_dict(self):
+        return {self.name: self.compute()}
+
+    # Make it behave somewhat like EvaluationMetric for the existing loop
+    def eval_func(self, model, data_loader, device, **kwargs):
+        self.reset()
+        model.eval()
+        with torch.no_grad():
+            for image, target_tuple in data_loader:
+                image = image.to(device, non_blocking=True)
+                processed_targets = []
+                for t_item in target_tuple:
+                    if isinstance(t_item, torch.Tensor):
+                        processed_targets.append(t_item.to(device, non_blocking=True))
+                    else:
+                        processed_targets.append(t_item)
+                
+                model_output_dict = model(image)
+                self.update(model_output_dict, tuple(processed_targets))
+        return self.compute()
+
+
+def get_eval_metric(metric_config_key, metric_config_value=None, **kwargs_passed_from_main_loop):
+    # metric_config_key: e.g., "accuracy_chunk0" (the key from YAML eval_metrics list of dicts)
+    # metric_config_value: e.g., {"type": "AccuracyForChunk", "params": {"chunk_id": 0}} (the value for that key)
+    # kwargs_passed_from_main_loop: In current main script, this is empty when get_eval_metric is called at metric setup.
+    #                               But the eval_func it returns is called with many kwargs.
+
+    if metric_config_value is None: 
+        metric_type = metric_config_key
+        constructor_params = {}
+    else:
+        metric_type = metric_config_value.get('type', metric_config_key)
+        constructor_params = metric_config_value.get('params', {})
+
+    # Check new stateful metrics first
+    if metric_type in _EVAL_METRIC_NAME_CLASS_DICT:
+        MetricClass = _EVAL_METRIC_NAME_CLASS_DICT[metric_type]
+        # Instantiate the stateful metric object
+        metric_instance = MetricClass(**constructor_params)
+        # Wrap it in EvaluationMetric to fit the existing main loop structure for now.
+        # The eval_func of the stateful metric will run its own loop.
+        return EvaluationMetric(eval_func=metric_instance.eval_func, # Use the new eval_func from the metric class
+                                init_best_val=0 if 'acc' in metric_type.lower() else float('inf'), # Basic heuristic
+                                comparator=lambda curr, new: new > curr if 'acc' in metric_type.lower() else new < curr) # Basic
+    
+    # Fallback to existing function-based EvaluationMetric wrappers in this file
+    if metric_type in EVAL_METRIC_DICT:
+        # This returns the EvaluationMetric wrapper with its predefined eval_func
+        return EVAL_METRIC_DICT[metric_type]
+
+    # Fallback to torchdistill's default get_eval_metric
+    try:
+        from torchdistill.eval import get_eval_metric as get_torchdistill_eval_metric
+        # This is tricky. torchdistill's get_eval_metric might return a stateful metric or a simple function.
+        # For now, assume it returns something that can be wrapped or is already an EvaluationMetric-like object.
+        # This path might need more robust handling if torchdistill metrics are stateful and different.
+        td_metric = get_torchdistill_eval_metric(metric_type, **constructor_params)
+        if hasattr(td_metric, 'eval_func'): # If it's already an EvaluationMetric-like object
+            return td_metric
+        elif callable(td_metric): # If it's a function, wrap it
+             return EvaluationMetric(eval_func=td_metric,
+                                    init_best_val=0, comparator=lambda x,y: y>x) # generic wrapper
+        logger.warning(f"Torchdistill metric '{metric_type}' might not be fully compatible with current wrapper.")
+        return td_metric # Return as is if unsure
+    except ValueError:
+        raise ValueError(f'Unsupported metric type: {metric_type} (also not found in custom or torchdistill registries)')
 
 

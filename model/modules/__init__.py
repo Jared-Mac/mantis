@@ -12,6 +12,7 @@ from . import hyper
 from . import autoregressive
 from . import stem
 from . import task_predictors
+from .backbones import MultiTailResNetBackbone
 
 # You might also want to import specific functions or classes to make them 
 # available directly from model.modules, e.g.:

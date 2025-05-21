@@ -1,0 +1,152 @@
+datasets:
+  name: cifar100_chunked_film_tiny
+  type: LabelChunkedTaskDataset # To be loaded by a custom dataset getter
+  dataset_id: &cifar100_chunked_train_tiny cifar100_chunked_train_tiny
+  val_dataset_id: &cifar100_chunked_val_tiny cifar100_chunked_val_tiny
+  # root: './data/cifar100' # Not strictly needed if use_tiny_version_path is used for org_datasets
+  # download: true # Not needed for org_datasets if tiny is used
+  task_configs:
+    - task_id: 0
+      original_labels: { range: [0, 50] } # Classes 0-49
+      num_classes: 50
+    - task_id: 1
+      original_labels: { range: [50, 100] } # Classes 50-99
+      num_classes: 50
+  train_transform: # Standard CIFAR-100 transforms
+    - type: Resize
+      params:
+        size: [32, 32] 
+    - type: RandomCrop # For tiny test, maybe less aggressive augmentation or none
+      params:
+        size: [32, 32]
+        padding: 0 # No padding for tiny test to ensure data is used as is after resize
+    - type: RandomHorizontalFlip
+      params:
+        p: 0.0 # No flip for tiny test consistency
+    - type: ToTensor
+      params: {}
+    - type: Normalize
+      params:
+        mean: [0.5071, 0.4867, 0.4408]
+        std: [0.2675, 0.2565, 0.2761]
+  val_transform: # Standard CIFAR-100 transforms
+    - type: Resize
+      params:
+        size: [32, 32]
+    - type: ToTensor
+      params: {}
+    - type: Normalize
+      params:
+        mean: [0.5071, 0.4867, 0.4408]
+        std: [0.2675, 0.2565, 0.2761]
+  train_data_loader:
+    dataset_id: *cifar100_chunked_train_tiny
+    batch_size: 8 # Reduced batch size
+    shuffle: false # No shuffle for tiny test consistency
+    num_workers: 0 # Reduced num_workers
+    pin_memory: true
+  val_data_loader:
+    dataset_id: *cifar100_chunked_val_tiny
+    batch_size: 8 # Reduced batch size
+    shuffle: false
+    num_workers: 0 # Reduced num_workers
+    pin_memory: true
+  org_dataset_configs: # Configuration for the underlying CIFAR100 dataset
+    cifar100_train:
+      type: CIFAR100 # This type is used by registry to know how to load original if not tiny
+      params:
+        # root: './data/cifar100' # Not needed if tiny path used
+        # train: true
+        use_tiny_version_path: "testing/tiny_cifar100_train.pt" # Path to tiny train data
+        # download: false # Not needed
+        # transform_params will be picked up by LabelChunkedTaskDataset which gets top-level train_transform
+    cifar100_val:
+      type: CIFAR100
+      params:
+        # root: './data/cifar100'
+        # train: false
+        use_tiny_version_path: "testing/tiny_cifar100_val.pt" # Path to tiny val data
+        # download: false
+        # transform_params will be picked up by LabelChunkedTaskDataset which gets top-level val_transform
+
+models:
+  student_model: 
+    name: FiLMedNetworkWithSharedStem 
+    network_type: FiLMedNetworkWithSharedStem 
+    params:
+      shared_stem_config:
+        name: ConvStem 
+        params:
+          input_channels: 3
+          output_channels: 64 
+      task_probability_model_config:
+        name: TaskProbabilityModel 
+        params:
+          input_channels_from_stem: 64 
+          num_tasks: 2 
+      compression_module_config: 
+        name: FiLMedHFactorizedPriorCompressionModule 
+        params:
+          analysis_config: 
+            name: TaskConditionedFiLMedAnalysisNetwork 
+            params:
+              input_channels_from_stem: 64 
+              film_cond_dim: 2 
+              num_filters: 64 # Example, keep small for tiny test
+              num_levels: 2   # Example
+          synthesis_config: 
+            name: TaskConditionedSynthesisNetwork 
+            params:
+              num_filters: 64 # Example
+              num_levels: 2   # Example
+          hyper_analysis_config: 
+            name: HyperAnalysisNetwork 
+            params:
+              num_filters: 64 # Example
+          hyper_synthesis_config: 
+            name: HyperSynthesisNetwork 
+            params:
+              num_filters: 64 # Example
+      backbone_config: 
+        name: MultiTailResNetBackbone 
+        params:
+          input_features_dim: 64 # Should match output of compression_module's synthesis part
+          num_tails: 2
+          per_tail_output_classes: 50
+          num_blocks: [1,1,1,1] # Smaller ResNet for faster test
+      reconstruction_layer_for_backbone_config: 
+        name: Identity 
+        params: {}
+      analysis_config_parent: {}
+
+train:
+  log_freq: 1 # Log more frequently for tiny test
+  num_epochs: 1 # Reduced epochs
+  optimizer:
+    type: AdamW
+    params:
+      lr: 0.001
+      weight_decay: 0.0001
+  lr_scheduler: # Optional for 1 epoch, but keep for structure
+    type: MultiStepLR
+    params:
+      milestones: [1] # Effectively no change if only 1 epoch
+      gamma: 0.1
+  criterion:
+    type: ChunkedCrossEntropyLoss 
+    params:
+      num_chunks: 2
+      task_loss_weight: 0.5
+      chunk_loss_weight: 0.5
+  eval_metrics: 
+    - accuracy_chunk0: {type: AccuracyForChunk, params: {chunk_id: 0}} 
+    - accuracy_chunk1: {type: AccuracyForChunk, params: {chunk_id: 1}} 
+    - task_accuracy: {type: TaskPredictionAccuracy} 
+
+test: 
+  eval_metrics:
+    - accuracy_chunk0: {type: AccuracyForChunk, params: {chunk_id: 0}}
+    - accuracy_chunk1: {type: AccuracyForChunk, params: {chunk_id: 1}}
+    - task_accuracy: {type: TaskPredictionAccuracy}
+  test_data_loader: 
+    dataset_id: *cifar100_chunked_val_tiny
