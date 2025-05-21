@@ -1,6 +1,8 @@
-# FrankenSplit
+# Mantis
 
-Official Repository for the paper on FrankenSplit: Efficient Neural Feature Compression with Shallow Variational Bottleneck
+Author: Jared Macshane (PhD student at UCI)
+
+Official Repository for the paper on Mantis: Efficient Neural Feature Compression with Shallow Variational Bottleneck
 Injection for Mobile Edge Computing
 
 If you find this work interesting, please check the [follow up ](https://github.com/rezafuru/the-fool)
@@ -65,7 +67,7 @@ To test with pre-trained weights: `python main_classification_torchdistill.py --
 @ARTICLE{10480247,
   author={Furutanpey, Alireza and Raith, Philipp and Dustdar, Schahram},
   journal={IEEE Transactions on Mobile Computing}, 
-  title={FrankenSplit: Efficient Neural Feature Compression With Shallow Variational Bottleneck Injection for Mobile Edge Computing}, 
+  title={Mantis: Efficient Neural Feature Compression With Shallow Variational Bottleneck Injection for Mobile Edge Computing}, 
   year={2024},
   volume={23},
   number={12},
