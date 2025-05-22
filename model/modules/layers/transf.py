@@ -1,3 +1,35 @@
+"""
+This module provides components and building blocks related to Transformer
+architectures, such as attention mechanisms, patch embedding, patch
+merging/splitting, and Transformer blocks (e.g., Swin Transformer blocks).
+
+These components are used to construct Transformer-based analysis networks
+(`model.modules.analysis.py`), synthesis networks
+(`model.modules.synthesis.py`), or reconstruction layers
+(`model.modules.layers.recon.py`). For example, `SwinTransformerBlock` and
+`WindowAttention` are core parts of Swin Transformer based models, while
+`PatchEmbed` and `PatchMerging` handle the initial tokenization and
+downsampling stages in such models.
+
+Key classes provided by the module:
+    - Mlp: Standard Multi-Layer Perceptron used within Transformer blocks.
+    - PatchMerging: Merges patches (tokens) to reduce spatial resolution and
+      increase channel depth, typically used in downsampling stages of
+      hierarchical Transformers.
+    - ReversePatchMerging: The inverse of PatchMerging, used for upsampling.
+    - Tokenizer: Flattens spatial dimensions of feature maps into token sequences.
+    - Detokenizer / Detokenizer2: Reshapes token sequences back into spatial
+      feature maps.
+    - PatchEmbed: Converts input images into patch embeddings (tokens).
+    - SwinTransformerBlock: A core block of the Swin Transformer, incorporating
+      windowed and shifted window attention.
+    - Attention: A standard self-attention mechanism.
+    - WindowAttention: Self-attention performed within local windows.
+    - HybridSwinStage: A Swin Transformer stage that can incorporate a
+      convolutional module for down/upsampling instead of standard patch merging.
+    - ViTBlock: A standard Vision Transformer block.
+    - BasicSwinStage: A fundamental stage of a Swin Transformer.
+"""
 import math
 from collections import OrderedDict
 

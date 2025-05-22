@@ -1,3 +1,34 @@
+"""
+This module provides a collection of custom convolutional blocks, layers, and
+utilities, including standard convolutional blocks, residual blocks, blocks with
+GDN normalization, attention mechanisms, and specialized structures like Octave
+Convolutions and ASPP.
+
+These layers are fundamental building blocks used in constructing various network
+components, such as analysis networks (`model.modules.analysis.py`), synthesis
+networks (`model.modules.synthesis.py`), stems (`model.modules.stem.py`), and
+reconstruction layers (`model.modules.layers.recon.py`). They offer more
+specialized functionalities beyond standard PyTorch Conv2d layers.
+
+An overview of the types of layers provided includes (but is not limited to):
+    - Basic Convolutional Blocks: `ConvBlock1x1`, `ConvBlock3x3`, `ConvBlock5x5`,
+      `ConvBlock`, `TConvBlock`.
+    - Blocks with GDN/IGDN: `ConvGDNBlock`, `ConvIGDNBlock`, `TConvIGDNBlock`.
+    - Residual Blocks: `ResidualBlockWithStride`, `ResidualBlockUpsample`,
+      `ResidualBlockUpsampleTranspose`, `ResidualBlockUpsampleGDN1`,
+      `ResidualBlockGDN1`, `ResidualBlockWithStrideGDN1`.
+    - Attention Mechanisms: `ChannelAttentionBlockAdd`, `ChannelAttentionBlockCat`.
+    - Specialized Structures:
+        - `ConvNeXtStage`: A stage from the ConvNeXt architecture.
+        - `SalientDownsampler`: A module for downsampling based on saliency.
+        - `ASPP` (Atrous Spatial Pyramid Pooling): `ASPPConv`, `ASPPPooling`, `ASPP`.
+        - Octave Convolutions: `GeneralizedOctaveConv`,
+          `GeneralizedOctaveTransposeConv`, `GeneralizedResidualOctaveConv`,
+          `GeneralizedAtrousOctaveConv`, `FirstOctave`, `LastOctave`, etc.
+    - Helper functions for creating convolutions: `conv1x1`, `conv3x3`, `conv5x5`,
+      `subpel_conv3x3`.
+    - `MLP`: A simple Multi-Layer Perceptron.
+"""
 from functools import partial
 from typing import Iterable, List, Optional
 
@@ -78,7 +109,6 @@ class SalientDownsampler(nn.Module):
         super(SalientDownsampler, self).__init__()
 
         self.layers = nn.Sequential(
-            # nn.LayerNorm(embed_dim),
             nn.Linear(in_features=embed_dim, out_features=embed_dim),
             nn.GELU(),
             nn.Linear(in_features=embed_dim, out_features=embed_dim // 2),
@@ -97,22 +127,10 @@ class SalientDownsampler(nn.Module):
         x = x.flatten(2).transpose(1, 2)
         b, _, c = x.shape
         decision_scores = self.layers(x)
-        # if self.training:
-        # (B, hxw, 2) -> (B, hxw, 1)
         decision_mask = F.gumbel_softmax(decision_scores, hard=True)[:, :, 0:1]
-        # (B, hxw, C) -> (B, hxw, C)
         masked_x = x * decision_mask.expand_as(x)
         salient_pixels = torch.topk(torch.clamp(masked_x, min=0), k=no_salient_pixels, dim=1)[0]
-        # (B, hxw, C) -> (B, C, H, W)
-        # return decision scores for loss (Use hard decision for rest of network, but we need the soft values for binary cross entropy Loss)
         salient_pixels = salient_pixels.transpose(1, 2).view(b, c, h, w)
-        # else:
-        #     decision_mask = torch.argsort(decision_scores[:, :, 0], dim=1, descending=True)[:, :no_salient_pixels]
-        #     salient_pixels = torch.zeros(size=(b, no_salient_pixels, c), device=x.device)
-        #     for idx in range(b):
-        #         salient_pixels[idx] = torch.index_select(x[idx], dim=1, index=decision_mask[idx])
-        #     # (B, hxw, C) -> (B, hxw, 1)
-        #     salient_pixels = salient_pixels.transpose(1, 2).view(b, c, h, w)
 
         if return_decision_scores:
             return decision_scores, salient_pixels
@@ -388,7 +406,6 @@ class ResidualBlockWithStrideGDN1(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, stride: int = 2, activation=nn.LeakyReLU, skip_gdn=False):
         super().__init__()
         self.conv1 = conv3x3(in_ch, out_ch, stride=stride)
-        # self.act = activation() if isinstance(activation, nn.Module) else activation
         self.act = activation()
         self.conv2 = conv3x3(out_ch, out_ch)
         self.gdn = cail.GDN1(out_ch) if not skip_gdn else nn.Identity()
@@ -616,7 +633,6 @@ class ASPP(nn.Module):
 
         if ds_strategy == 'maxp':
             self.ds = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        # note: adds way too many parametrs, don't try lol
         elif ds_strategy == 'conv':
             self.ds = nn.Conv2d(in_channels=out_channels,
                                 out_channels=out_channels,

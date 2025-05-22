@@ -1,3 +1,17 @@
+"""
+This module provides preconfigured layer setups, intended to simplify the
+definition of certain network structures by packaging common layer sequences or
+parameterizations.
+
+These preconfigurations can be used by other modules, for instance, to define
+specific deconvolutional pathways in synthesis networks (like
+`SynthesisNetworkSwinTransform` in `model.modules.synthesis.py`) or other parts
+of the network that benefit from standardized block arrangements. The function
+`get_layer_preconfiguration` is used to retrieve these setups by name.
+
+Currently includes configurations for deconvolutional layers and stages with
+varying upsampling and stride strategies.
+"""
 from compressai.layers import GDN
 from timm.layers import LayerNorm2d
 from torch import nn

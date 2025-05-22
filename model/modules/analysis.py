@@ -1,3 +1,22 @@
+"""
+This module provides various analysis (encoder) network architectures used within
+the compression models.
+
+These analysis networks are typically instantiated and used by `CompressionModule`
+subclasses defined in `model.modules.compressor.py`. They take input data (or
+features from a stem) and transform it into a latent representation to be
+quantized and compressed. Some analysis networks, like
+`TaskConditionedFiLMedAnalysisNetwork`, can accept conditioning signals from
+modules like `TaskProbabilityModel` in `model.modules.task_predictors.py` to
+adapt their behavior.
+
+Key classes provided by the module:
+    - AnalysisNetwork: Base class for analysis networks.
+    - AnalysisNetworkCNN: A CNN-based analysis network.
+    - QuantizableSimpleAnalysisNetwork2: A simple, quantizable CNN-based analysis network.
+    - TaskConditionedFiLMedAnalysisNetwork: An analysis network that can be
+      conditioned using FiLM layers based on an external signal.
+"""
 from collections import OrderedDict
 from functools import partial
 
