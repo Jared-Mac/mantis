@@ -1,3 +1,22 @@
+"""
+This module provides utility functions and wrappers for integrating models from
+the PyTorch Image Models (TIMM) library.
+
+It allows for easy loading and modification of TIMM models (e.g., ResNet, DeiT,
+Swin Transformer) to be used as backbones in various network architectures
+defined in `model/network.py`. Functions like `get_timm_model` handle
+pretrained weight loading, classifier head modification, and model surgery
+(like splitting or skipping stages). Wrappers like `TimmDeiTWrapper` and
+`TimmResnetWrapper` adapt TIMM models to a consistent interface or structure
+if needed.
+
+Key functions and classes:
+    - get_timm_model: Loads a TIMM model, with options for pretraining,
+      modifying the classifier head, and performing model surgery.
+    - TimmDeiTWrapper: A wrapper for TIMM's DeiT models.
+    - TimmResnetWrapper: A wrapper for TIMM's ResNet models.
+    - get_timm_with_cai_encoder: Combines a TIMM model with a CompressAI encoder.
+"""
 import types
 from collections import OrderedDict
 

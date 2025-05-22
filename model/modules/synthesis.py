@@ -1,3 +1,24 @@
+"""
+This module provides various synthesis (decoder) network architectures used
+within compression models.
+
+These synthesis networks are typically instantiated and used by `CompressionModule`
+subclasses (defined in `model.modules.compressor.py`). They take the
+reconstructed latent representation (y_hat) from the entropy model and
+transform it back into the data space (e.g., an image, or features for a
+downstream task). Some synthesis networks might have a `final_layer` attribute
+that can be set to a reconstruction layer from `model.modules.layers.recon.py`
+for task-specific output adaptation.
+
+Key classes provided by the module:
+    - SynthesisNetwork: Base class for synthesis networks.
+    - GenericResidualSynthesisNetwork: A synthesis network built with residual blocks.
+    - SynthesisNetworkConvNeXtTransform: A synthesis network based on ConvNeXt architecture.
+    - SimpleSynthesisNetwork: A simple synthesis network with residual blocks and upsampling.
+    - SkipSynthesis: An identity mapping, effectively skipping the synthesis step.
+    - SynthesisNetworkCNN: A CNN-based synthesis network using I-GDN blocks.
+    - SynthesisNetworkSwinTransform: A synthesis network based on Swin Transformer architecture.
+"""
 import math
 from collections import OrderedDict
 from functools import partial
