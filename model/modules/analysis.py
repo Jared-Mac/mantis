@@ -1,3 +1,22 @@
+"""
+This module provides various analysis (encoder) network architectures used within
+the compression models.
+
+These analysis networks are typically instantiated and used by `CompressionModule`
+subclasses defined in `model.modules.compressor.py`. They take input data (or
+features from a stem) and transform it into a latent representation to be
+quantized and compressed. Some analysis networks, like
+`TaskConditionedFiLMedAnalysisNetwork`, can accept conditioning signals from
+modules like `TaskProbabilityModel` in `model.modules.task_predictors.py` to
+adapt their behavior.
+
+Key classes provided by the module:
+    - AnalysisNetwork: Base class for analysis networks.
+    - AnalysisNetworkCNN: A CNN-based analysis network.
+    - QuantizableSimpleAnalysisNetwork2: A simple, quantizable CNN-based analysis network.
+    - TaskConditionedFiLMedAnalysisNetwork: An analysis network that can be
+      conditioned using FiLM layers based on an external signal.
+"""
 from collections import OrderedDict
 from functools import partial
 
@@ -15,6 +34,14 @@ from model.modules.module_registry import register_analysis_network
 from .layers.film import FiLMGenerator, FiLMLayer
 
 class AnalysisNetwork(nn.Module):
+    """
+    Base class for analysis (encoder) networks.
+
+    This class serves as a common interface and provides basic functionalities
+    like weight initialization for all analysis network implementations.
+    Derived classes should implement the specific architecture and the
+    `forward` method.
+    """
     def __init__(self):
         super(AnalysisNetwork, self).__init__()
 
@@ -41,8 +68,24 @@ class AnalysisNetwork(nn.Module):
 
 @register_analysis_network
 class AnalysisNetworkCNN(AnalysisNetwork):
+    """
+    A CNN-based analysis (encoder) network.
+
+    This network uses a sequence of `ConvGDNBlock` layers to transform the
+    input into a latent representation. The architecture can be customized
+    by providing a list of block parameters.
+
+    Args:
+        latent_channels (int): The number of channels in the final latent
+            representation. This is used to define the default `block_params`
+            if none are provided.
+        block_params (list of tuple, optional): A list where each tuple defines
+            the parameters for a `ConvGDNBlock`. Each tuple should be in the
+            format `(in_channels, out_channels, kernel_size, stride, padding)`.
+            If None, a default architecture is used.
+    """
     def __init__(self, latent_channels, block_params=None):
-        super(AnalysisNetwork, self).__init__()
+        super(AnalysisNetworkCNN, self).__init__()
         gdn_blocks = []
 
         if not block_params:

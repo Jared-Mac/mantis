@@ -1,3 +1,31 @@
+"""
+This module provides a registry system for various neural network components
+used within the project.
+
+It allows for dynamic instantiation of different types of modules like analysis
+networks, synthesis networks, hyper-networks, custom compression modules, and
+autoregressive components by their registered names. This is heavily used in
+configuration-driven model creation, where network architectures are specified
+in YAML files and components are retrieved using functions like
+`get_analysis_network`, `get_synthesis_network`, etc.
+
+Key dictionaries and their corresponding getter/register functions include:
+    - ANALYSIS_NETWORK_DICT: Stores analysis network classes.
+        - get_analysis_network(name, **kwargs)
+        - register_analysis_network(cls)
+    - SYNTHESIS_NETWORK_DICT: Stores synthesis network classes.
+        - get_synthesis_network(name, **kwargs)
+        - register_synthesis_network(cls)
+    - HYPER_NETWORK_DICT: Stores hyper-network classes.
+        - get_hyper_network(name, **kwargs)
+        - register_hyper_network(cls)
+    - CUSTOM_COMPRESSION_MODULE_DICT: Stores custom compression module classes.
+        - get_custom_compression_module(name, **kwargs)
+        - register_custom_compression_module(cls)
+    - AUTOREGRESSIVE_COMPONENT_DICT: Stores autoregressive component classes.
+        - get_autoregressive_component(name, **kwargs)
+        - register_autoregressive_component(cls)
+"""
 from torchdistill.common.constant import def_logger
 
 SYNTHESIS_NETWORK_DICT = dict()

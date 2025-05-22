@@ -1,3 +1,37 @@
+"""
+This module defines the core logic for learned image and feature compression.
+It includes a base `CompressionModule` class and various derived implementations
+that incorporate different entropy modeling strategies.
+
+These modules are central components in networks like
+`SplittableClassifierWithCompressionModule` (defined in `model/network.py`).
+They utilize analysis networks (from `model.modules.analysis.py`) to create
+latent representations, entropy models (like `EntropyBottleneck`,
+`GaussianConditional`, and components from `model.modules.autoregressive.py` or
+`model.modules.hyper.py`) for quantization and bitstream generation, and
+synthesis networks (from `model.modules.synthesis.py`) to reconstruct the data
+from the latents.
+
+Key classes and concepts:
+    - CompressionModule: Base class for all compression modules, defining the
+      core interface (compress, decompress, update, etc.). It uses an analysis
+      transform (g_a) and a synthesis transform (g_s).
+    - FactorizedPriorModule: A compression module using a simple factorized prior
+      entropy model.
+    - ScaleHyperpriorModule: Implements a scale hyperprior model, where a hyper-encoder
+      (h_a) and hyper-decoder (h_s) are used to predict the scales for a Gaussian
+      conditional entropy model.
+    - MeanScaleHyperpriorModule: Extends the scale hyperprior by also predicting
+      the means for the Gaussian conditional.
+    - FiLMedHFactorizedPriorCompressionModule: A factorized prior model that can
+      be conditioned using FiLM layers in its analysis network, allowing for
+      task-adaptive compression.
+    - The general workflow involves:
+        - `forward()`: Typically for training, passes data through g_a, entropy
+          model, and g_s.
+        - `compress()`: Encodes input into a bitstream (or representation of it).
+        - `decompress()`: Decodes from the bitstream back to the data space.
+"""
 from collections import namedtuple
 from functools import partial
 from typing import Any, List, Tuple, Optional
@@ -87,9 +121,32 @@ class MultiresBottleneck(nn.Module):
 
 class CompressionModule(CompressionModel):
     """
-        We embed a compression model as a module in a larger network
+    Base class for learnable compression models, designed to be embedded within
+    larger neural network architectures.
 
-        Based on https://github.com/yoshitomo-matsubara/sc2-benchmark/blob/main/sc2bench/models/layer.py
+    This class extends `compressai.models.CompressionModel` and provides a
+    framework for defining an analysis transform (`g_a`), a synthesis transform
+    (`g_s`), and an entropy bottleneck. The analysis transform maps input data
+    to a latent representation, which is then quantized and compressed by the
+    entropy bottleneck. The synthesis transform reconstructs the data from the
+    quantized latent representation.
+
+    It defines a common interface for training (`forward_train`), compression
+    (`compress`), decompression (`decompress`), and updating the entropy
+    bottleneck state (`update`). Derived classes implement specific compression
+    strategies and entropy models.
+
+    Args:
+        entropy_bottleneck_channels (int): Number of channels in the output of
+            the entropy bottleneck.
+        analysis_config (dict): Configuration dictionary for instantiating the
+            analysis transform (`g_a`) using `get_analysis_network` from the
+            module registry.
+        synthesis_config (dict, optional): Configuration dictionary for
+            instantiating the synthesis transform (`g_s`) using
+            `get_synthesis_network`. If None, `g_s` defaults to `nn.Identity`.
+        quantization_config (dict, optional): Configuration for quantization
+            parameters, if quantization is to be applied. Defaults to None.
     """
 
     def __init__(self,
@@ -137,6 +194,25 @@ class CompressionModule(CompressionModel):
 
 @register_custom_compression_module
 class FactorizedPriorModule(CompressionModule):
+    """
+    A compression model implementing a simple factorized prior entropy model.
+
+    This module uses an analysis transform (`g_a`) to produce latents `y`,
+    which are then quantized and entropy-coded using a single `EntropyBottleneck`.
+    The synthesis transform (`g_s`) reconstructs the output from the quantized
+    latents `y_hat`. This model is a common baseline in learned image compression.
+
+    It inherits from `CompressionModule` and implements its core methods for
+    training, compression, and decompression using this factorized prior approach.
+
+    Args:
+        entropy_bottleneck_channels (int): Number of channels for the
+            `EntropyBottleneck` and the latent representation `y`.
+        analysis_config (dict): Configuration for the analysis transform (`g_a`).
+        synthesis_config (dict, optional): Configuration for the synthesis
+            transform (`g_s`).
+        quantization_config (dict, optional): Configuration for quantization.
+    """
     def __init__(self,
                  entropy_bottleneck_channels,
                  analysis_config,
@@ -276,9 +352,7 @@ class FactorizedPriorWithSalientDownsampler(CompressionModule):
 
     def forward_train(self, x, return_likelihoods=False):
         if isinstance(x, list):
-            # too lazy to do this properly with torchdistill
             x, _ = x
-        # register salient downsampler with hooks for loss, discard here
         _, y = self.salient_downsampler(self.g_a(x), return_decision_scores=True)
         y_hat, y_likelihoods = self.entropy_bottleneck(y)
         x_hat = self.g_s(y_hat)
@@ -466,17 +540,38 @@ class FactorizedPriorModuleWithBranch(CompressionModule):
 @register_custom_compression_module
 class ScaleHyperpriorModule(CompressionModule):
     """
-        SHP entropymodel introduced in https://arxiv.org/pdf/1802.01436.pdf
+    Implements a scale hyperprior compression model, based on the work by
+    Ballé et al. (2018) "Variational image compression with a scale hyperprior"
+    (https://arxiv.org/abs/1802.01436).
+
+    This model extends the factorized prior by introducing a hyperprior.
+    The main latents `y` (output of `g_a`) are modeled using a Gaussian
+    conditional distribution where the scale parameters are predicted by a
+    hyper-network. The hyper-network consists of a hyper-analysis transform
+    (`h_a`) that processes `y` (typically `abs(y)`) to produce hyper-latents `z`,
+    and a hyper-synthesis transform (`h_s`) that transforms quantized `z_hat`
+    into the scale parameters for `y`. The hyper-latents `z` are themselves
+    entropy-coded using an `EntropyBottleneck`.
+
+    Args:
+        entropy_bottleneck_channels (int): Number of channels for the hyper-latents
+            `z` and thus the output of the hyper-analysis transform (`h_a`).
+        analysis_config (dict): Configuration for the main analysis transform (`g_a`).
+        synthesis_config (dict): Configuration for the main synthesis transform (`g_s`).
+        hyper_network_config (dict): Configuration for the `HyperNetwork`
+            (containing `h_a` and `h_s`).
+        **kwargs: Additional keyword arguments.
     """
 
     def __init__(self,
-                 # entropy bottleneck channels is now output C of h_a
-                 entropy_bottleneck_channels,
+                 entropy_bottleneck_channels, # This is for z (hyper-latents)
                  analysis_config,
                  synthesis_config,
                  hyper_network_config,
                  **kwargs):
-        # lattent channels is output of g_a and input of h_a
+        # The `entropy_bottleneck_channels` for the parent CompressionModule
+        # now refers to the channels of the hyper-latent `z`.
+        # The channels of `y` are determined by `g_a` and `h_a`.
         super(ScaleHyperpriorModule, self).__init__(entropy_bottleneck_channels, analysis_config, synthesis_config)
         self.hyper_network: HyperNetwork = get_hyper_network(hyper_network_config["name"],
                                                              **hyper_network_config["params"])
@@ -603,7 +698,6 @@ class MeanScaleHyperpriorModule(ScaleHyperpriorModule):
             y_hat = self.gaussian_conditional.dequantize(
                 self.gaussian_conditional.quantize(y, 'dequantize', means_hat)
             )
-            # y_hat = F.interpolate(input=y_hat, size=14, mode='bicubic') if self.interpol_to_16x16 else y_hat
             y_hat = y_hat.detach()
             return self.g_s(y_hat)
         return self.forward_train(x, return_likelihoods)
@@ -865,29 +959,26 @@ class RecursiveMeanScaleHyperprior(CompressionModule):
 class FiLMedHFactorizedPriorCompressionModule(FactorizedPriorModule):
     def __init__(self,
                  entropy_bottleneck_channels,
-                 analysis_config, # This will now point to TaskConditionedFiLMedAnalysisNetwork
+                 analysis_config, 
                  synthesis_config=None,
                  quantization_config=None):
         super().__init__(entropy_bottleneck_channels,
-                         analysis_config, # g_a is created here
+                         analysis_config, 
                          synthesis_config,
                          quantization_config=quantization_config)
 
-    # Modify forward methods to accept features from stem and conditioning_signal
     def forward_train(self, x_from_stem, return_likelihoods=False, conditioning_signal=None):
-        y = self.g_a(x_from_stem, conditioning_signal=conditioning_signal) # Pass signal to g_a
-        # ... rest of the logic ...
+        y = self.g_a(x_from_stem, conditioning_signal=conditioning_signal) 
         y_hat, y_likelihoods = self.entropy_bottleneck(y)
-        x_hat_features = self.g_s(y_hat) # g_s reconstructs features for the backbone
+        x_hat_features = self.g_s(y_hat) 
         if return_likelihoods:
             return x_hat_features, {"y": y_likelihoods}
         else:
             return x_hat_features
 
     def forward(self, x_from_stem, return_likelihoods=False, conditioning_signal=None):
-        if self.updated and not return_likelihoods: # Inference
+        if self.updated and not return_likelihoods: 
             y = self.g_a(x_from_stem, conditioning_signal=conditioning_signal)
-            # ... quantization and dequantization ...
             y_h = self.entropy_bottleneck.dequantize(
                 self.entropy_bottleneck.quantize(y, 'dequantize', self.get_means(y))
             )
@@ -898,6 +989,5 @@ class FiLMedHFactorizedPriorCompressionModule(FactorizedPriorModule):
 
     def compress(self, x_from_stem, conditioning_signal=None, *args, **kwargs):
         y = self.g_a(x_from_stem, conditioning_signal=conditioning_signal)
-        # ... compression logic for y ...
         y_strings = self.entropy_bottleneck.compress(y)
-        return y_strings, y.size()[2:] # Example output
+        return y_strings, y.size()[2:]

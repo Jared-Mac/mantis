@@ -1,3 +1,17 @@
+"""
+This module provides components used for autoregressive entropy modeling in
+learned image compression.
+
+These components, such as `MaskedConv2d`, are typically used within more complex
+entropy models (e.g., context models or entropy parameters predictors) that
+might be part of certain `CompressionModule` implementations in
+`model.modules.compressor.py`. They help capture spatial dependencies in the
+latent space to improve compression performance.
+
+Key classes provided by the module:
+    - MaskedConv2d: A convolutional layer with a causal mask for autoregressive modeling.
+    - Conv1x1EntropyParameter: A network of 1x1 convolutions used to predict entropy parameters.
+"""
 import torch
 
 from torch import Tensor, nn

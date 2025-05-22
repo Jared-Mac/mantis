@@ -1,3 +1,18 @@
+"""
+This module defines models that predict task-related information or generate
+conditioning signals, often used for task-adaptive compression.
+
+The `TaskProbabilityModel` can process features (e.g., from a `SharedInputStem`
+in `model.modules.stem.py`) to produce a conditioning signal. This signal can
+then be used by other modules, such as `TaskConditionedFiLMedAnalysisNetwork`
+(in `model.modules.analysis.py`) or FiLMed compression modules (like
+`FiLMedHFactorizedPriorCompressionModule` in `model.modules.compressor.py`),
+to adapt their behavior based on the predicted task characteristics.
+
+Key classes provided by the module:
+    - TaskProbabilityModel: Predicts a conditioning signal from input features,
+      typically used to modulate other network components.
+"""
 import torch
 from torch import nn
 

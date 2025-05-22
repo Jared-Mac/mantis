@@ -1,4 +1,22 @@
-# Restructure, group config for analysis and synthesis together to load just one
+"""
+This module defines hyper-network architectures, which are used in
+hyperprior-based learned compression models.
+
+Hyper-networks (like `SimpleResidualHyperNetwork`, `SimpleHyperNetwork`) are
+components of certain `CompressionModule` subclasses (e.g.,
+`ScaleHyperpriorModule`, `MeanScaleHyperpriorModule` in
+`model.modules.compressor.py`). They consist of a hyper-analysis (encoder)
+part that processes the main latent representation (y) to produce a hyper-latent
+(z), and a hyper-synthesis (decoder) part that transforms the quantized
+hyper-latent (z_hat) back into parameters (e.g., scale, mean) for the entropy
+model of the main latents.
+
+Key classes provided by the module:
+    - HyperNetwork: Base class for hyper-networks, providing `hyper_analysis` (g_a)
+      and `hyper_synthesis` (g_s) properties.
+    - SimpleResidualHyperNetwork: A hyper-network built using `ResidualBlockWithStride`.
+    - SimpleHyperNetwork: A hyper-network built using `ConvBlock3x3`.
+"""
 from torch import nn
 from timm.models.layers import trunc_normal_, to_2tuple
 

@@ -1,3 +1,25 @@
+"""
+This module defines various 'reconstruction' layers. These layers are typically
+used to adapt the output of a synthesis network (decoder) to the specific format
+required by a downstream task or backbone, or as the final output layer of a
+compression model if it's reconstructing an image.
+
+Instances of these layers can be assigned as the `final_layer` attribute of
+synthesis networks in `model.modules.synthesis.py`, or used within the main
+network structures in `model/network.py` to interface between the decompression
+part and the task-specific backbone. They often wrap or adapt other standard
+blocks like Swin stages, ResNet blocks, or simple convolutions.
+
+Key classes provided by the module:
+    - ConvNeXtTransformLayer: Adapts features using a ConvNeXt stage.
+    - SwinReconLayer: Adapts features using a Swin Transformer stage.
+    - ResNetReconLayer: Adapts features using ResNet bottlenecks.
+    - ResidualBlockReconLayer: A reconstruction layer based on a residual block.
+    - ConvBlockReconLayer: A reconstruction layer based on a 3x3 convolutional block.
+    - ProjectionReconLayer: A reconstruction layer using a 1x1 projection.
+    - OctaveReconLayer: Reconstruction using an Octave Convolution layer.
+    - AtrousReconLayer: Reconstruction using an Atrous Residual Block.
+"""
 from functools import partial
 
 from sc2bench.models.layer import register_layer_class

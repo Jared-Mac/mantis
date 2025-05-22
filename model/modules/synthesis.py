@@ -1,3 +1,24 @@
+"""
+This module provides various synthesis (decoder) network architectures used
+within compression models.
+
+These synthesis networks are typically instantiated and used by `CompressionModule`
+subclasses (defined in `model.modules.compressor.py`). They take the
+reconstructed latent representation (y_hat) from the entropy model and
+transform it back into the data space (e.g., an image, or features for a
+downstream task). Some synthesis networks might have a `final_layer` attribute
+that can be set to a reconstruction layer from `model.modules.layers.recon.py`
+for task-specific output adaptation.
+
+Key classes provided by the module:
+    - SynthesisNetwork: Base class for synthesis networks.
+    - GenericResidualSynthesisNetwork: A synthesis network built with residual blocks.
+    - SynthesisNetworkConvNeXtTransform: A synthesis network based on ConvNeXt architecture.
+    - SimpleSynthesisNetwork: A simple synthesis network with residual blocks and upsampling.
+    - SkipSynthesis: An identity mapping, effectively skipping the synthesis step.
+    - SynthesisNetworkCNN: A CNN-based synthesis network using I-GDN blocks.
+    - SynthesisNetworkSwinTransform: A synthesis network based on Swin Transformer architecture.
+"""
 import math
 from collections import OrderedDict
 from functools import partial
@@ -17,6 +38,19 @@ from model.modules.module_registry import register_synthesis_network
 
 
 class SynthesisNetwork(nn.Module):
+    """
+    Base class for synthesis (decoder) networks.
+
+    This class serves as a common interface and provides basic functionalities
+    like weight initialization for all synthesis network implementations.
+    Derived classes should implement the specific architecture and the
+    `forward` method.
+
+    A `final_layer` attribute (defaulting to `nn.Identity`) is provided,
+    which can be set by specific network configurations to a task-specific
+    reconstruction layer (e.g., from `model.modules.layers.recon`) to adapt
+    the output of the synthesis network.
+    """
     def __init__(self):
         super(SynthesisNetwork, self).__init__()
         self.final_layer = nn.Identity()
@@ -184,6 +218,20 @@ class SynthesisNetworkConvNeXtTransform(SynthesisNetwork):
 
 @register_synthesis_network
 class SimpleSynthesisNetwork(SynthesisNetwork):
+    """
+    A simple synthesis (decoder) network composed of `ResidualBlockWithStride`
+    layers for upsampling the latent representation back to the target feature space.
+
+    The network consists of a sequence of residual blocks that progressively
+    upsample and refine the features. The `final_layer` attribute, inherited
+    from `SynthesisNetwork`, can be used to append a final reconstruction layer.
+
+    Args:
+        in_channels (int): Number of channels in the input latent representation.
+        target_channels (int): Number of channels desired in the output feature map
+            (before the optional `final_layer`). The intermediate layers will
+            also scale their channel dimensions relative to this.
+    """
     def __init__(self, in_channels, target_channels):
         super(SimpleSynthesisNetwork, self).__init__()
         self.rb1 = ResidualBlockWithStride(in_ch=in_channels,
@@ -223,8 +271,29 @@ class SkipSynthesis(nn.Identity):
 
 @register_synthesis_network
 class SynthesisNetworkCNN(SynthesisNetwork):
+    """
+    A CNN-based synthesis (decoder) network using a sequence of
+    `TConvIGDNBlock` (transposed convolution with I-GDN) layers.
+
+    This network reconstructs data from a latent representation. The architecture
+    can be customized by providing a list of block parameters for the
+    transposed convolutional blocks. The `final_layer` attribute, inherited
+    from `SynthesisNetwork`, can be used to append a final reconstruction layer.
+
+    Args:
+        latent_channels (int): Number of channels in the input latent
+            representation. This is used as `in_channels` for the first
+            `TConvIGDNBlock` in the default `block_params`.
+        output_channels (int): The number of channels in the desired output
+            (before the optional `final_layer`). This is used to define the
+            default `block_params` if none are provided.
+        block_params (list of tuple, optional): A list where each tuple defines
+            the parameters for a `TConvIGDNBlock`. Each tuple should be in the
+            format `(in_channels, out_channels, kernel_size, stride, padding)`.
+            If None, a default architecture is used.
+    """
     def __init__(self, latent_channels, output_channels, block_params=None):
-        super(SynthesisNetwork, self).__init__()
+        super(SynthesisNetworkCNN, self).__init__()
         igdn_blocks = []
 
         if not block_params:
