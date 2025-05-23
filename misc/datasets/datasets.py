@@ -9,7 +9,9 @@ class LabelChunkedTaskDataset(Dataset):
                  original_dataset: Dataset, 
                  task_configs: list, 
                  default_task_id: int = -1, 
-                 default_task_specific_label: int = -1):
+                 default_task_specific_label: int = -1,
+                 image_key=None,  # Added for WebDataset compatibility
+                 label_key=None): # Added for WebDataset compatibility
 
         print(f"DEBUG: LabelChunkedTaskDataset received original_dataset of type: {type(original_dataset)}")
         if not isinstance(original_dataset, Dataset):
@@ -18,6 +20,8 @@ class LabelChunkedTaskDataset(Dataset):
         self.original_dataset = original_dataset
         self.default_task_id = default_task_id
         self.default_task_specific_label = default_task_specific_label # Make sure this matches the parameter name
+        self.image_key = image_key   # Store image_key
+        self.label_key = label_key   # Store label_key
 
         self.processed_task_configs = []
         self.task_id_to_dense_idx_map = {} 
@@ -65,7 +69,15 @@ class LabelChunkedTaskDataset(Dataset):
             print("Warning: Task configs provided but resulted in zero distinct tasks for the detector.")
 
     def __getitem__(self, index: int):
-        image, original_label = self.original_dataset[index] 
+        sample = self.original_dataset[index]
+
+        if self.image_key is not None and self.label_key is not None:
+            # Assume sample is a dictionary (e.g., from WebDataset)
+            image = sample[self.image_key]
+            original_label = sample[self.label_key]
+        else:
+            # Assume sample is a tuple, fallback to original behavior
+            image, original_label = sample
 
         if isinstance(original_label, torch.Tensor):
             original_label = original_label.item()
@@ -113,7 +125,10 @@ class MultiSourceTaskDataset(Dataset):
     Returns (image, label_from_original_dataset, task_id).
     The task_id corresponds to the key provided in the named_datasets dictionary.
     """
-    def __init__(self, named_datasets: dict):
+    def __init__(self, 
+                 named_datasets: dict, 
+                 image_key=None,  # Added for WebDataset compatibility
+                 label_key=None): # Added for WebDataset compatibility
         """
         Args:
             named_datasets (dict): A dictionary where keys are task_ids (str or int recommended)
@@ -123,7 +138,9 @@ class MultiSourceTaskDataset(Dataset):
         if not named_datasets:
             raise ValueError("named_datasets dictionary cannot be empty.")
             
-        self.named_datasets = named_datasets 
+        self.named_datasets = named_datasets
+        self.image_key = image_key   # Store image_key
+        self.label_key = label_key   # Store label_key
         self.task_ids_ordered = list(named_datasets.keys())
 
         datasets_for_concat = [self.named_datasets[task_id] for task_id in self.task_ids_ordered]
@@ -138,8 +155,17 @@ class MultiSourceTaskDataset(Dataset):
             "Mismatch in total length after concatenation and task ID mapping."
 
     def __getitem__(self, index: int):
-        image, label_from_original_dataset = self.concat_dataset[index]
+        sample = self.concat_dataset[index]
         task_id = self.sample_idx_to_task_id[index]
+
+        if self.image_key is not None and self.label_key is not None:
+            # Assume sample is a dictionary (e.g., from WebDataset)
+            image = sample[self.image_key]
+            label_from_original_dataset = sample[self.label_key]
+        else:
+            # Assume sample is a tuple, fallback to original behavior
+            image, label_from_original_dataset = sample
+            
         return image, label_from_original_dataset, task_id
 
     def __len__(self) -> int:

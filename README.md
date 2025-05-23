@@ -51,6 +51,57 @@ cd ../../../../../
 To train from scratch: `python main_classification_torchdistill.py --config path/to/config --skip_ckpt` 
 
 To test with pre-trained weights: `python main_classification_torchdistill.py --config path/to/config --test_only` (make sure that the weights are found)
+
+## Using WebDatasets with Ceph Storage
+
+This project now supports `webdataset` for reading data, which is particularly useful for large datasets stored in S3-compatible object storage like Ceph.
+
+### YAML Configuration for WebDataset
+
+To use WebDataset, you need to modify your dataset configuration in the YAML files. Change the `type` to `WebDataset` and provide the `url` to your dataset shards.
+
+Example snippet from a YAML configuration:
+
+```yaml
+datasets:
+  # ... other dataset definitions ...
+  your_dataset_name:
+    # ... other wrapper configs if any ...
+    splits:
+      train:
+        dataset_id: 'your_dataset_name/train'
+        params: 
+          original_dataset: 
+            type: 'WebDataset' # Use WebDataset
+            params:
+              url: 's3://YOUR_BUCKET/path/to/imagenet-train-{000000..000146}.tar' # URL to your data shards in Ceph/S3
+              transform:
+                _target_: misc.datasets.registry.parse_transform_config_list
+                config:
+                  # ... your list of transforms ...
+      val:
+        # ... similar configuration for validation set ...
+```
+
+### Environment Variables for S3/Ceph Access
+
+For `webdataset` to access data from S3-compatible storage like Ceph, you need to set the following environment variables before running your scripts:
+
+-   `AWS_ACCESS_KEY_ID`: Your S3 access key.
+-   `AWS_SECRET_ACCESS_KEY`: Your S3 secret key.
+-   `AWS_ENDPOINT_URL`: The S3 endpoint URL of your Ceph cluster (e.g., `http://your-ceph-s3-gateway.example.com:7480`).
+
+Optionally, you might need to set these depending on your Ceph configuration:
+
+-   `AWS_USE_SSL`: Set to `0` if your Ceph endpoint uses `http` (e.g., `AWS_USE_SSL=0`). Set to `1` if it uses `https` and this is not automatically detected.
+-   `AWS_S3_ADDRESSING_STYLE`: This can be `path` or `virtual`. For many Ceph setups, `path` style is used. If you encounter issues, try setting `AWS_S3_ADDRESSING_STYLE=path`.
+
+### Data URL Format
+
+The `url` parameter in your YAML configuration should point to the tar files stored on your Ceph cluster. `webdataset` supports brace expansion for specifying multiple shards, for example: `s3://my-imagenet-bucket/train-shards/imagenet-train-{000000..001023}.tar`.
+
+Additionally, wrapper classes such as `LabelChunkedTaskDataset` and `MultiSourceTaskDataset` have been enhanced. You can now specify `image_key` and `label_key` in their `params` in the YAML configuration. This allows them to correctly process data from underlying datasets (like WebDataset) that yield dictionaries (e.g., `{'image': tensor, 'label': tensor}`) instead of simple tuples.
+
 ## Notes
 - I've removed most code that was out of scope to include in the paper to avoid confusion but there are still some
   references to unpublished implementations/results.  Specifically, this repository was created by extracing relevant parts into its own Repository. 
