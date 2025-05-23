@@ -2,6 +2,7 @@
 from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision import datasets as torchvision_datasets # For easier access
+import webdataset
 
 
 DATASET_CLASS_DICT = dict()
@@ -80,7 +81,54 @@ def get_dataset(config: dict) -> Dataset:
             processed_constructor_params[key] = value
 
     # After processing all params:
-    if dataset_type in DATASET_CLASS_DICT:
+    if dataset_type == 'WebDataset':
+        # Ensure 'url' or 'urls' is present
+        if 'url' not in processed_constructor_params and 'urls' not in processed_constructor_params:
+            raise ValueError("WebDataset config must include 'url' or 'urls' parameter.")
+        
+        urls = processed_constructor_params.get('urls', processed_constructor_params.get('url'))
+        pipeline = webdataset.WebDataset(urls)
+        pipeline = pipeline.decode(webdataset.decode.imagehandler("torchrgb"))
+
+        if 'transform' in processed_constructor_params and processed_constructor_params['transform'] is not None:
+            user_transform = processed_constructor_params['transform']
+            def apply_transform(sample):
+                # Common image extensions, add more if needed
+                img_keys = ['jpg', 'png', 'jpeg', 'ppm', 'tif', 'tiff', 'bmp']
+                applied = False
+                for key in img_keys:
+                    if key in sample:
+                        sample[key] = user_transform(sample[key])
+                        applied = True
+                        break
+                if not applied:
+                    # This might happen if the image is not under a standard key
+                    # Or if the sample is not a dict (e.g. already a tuple)
+                    # For now, we'll log a warning if a transform was provided but not applied
+                    # Or, if webdataset.decode.imagehandler already returns (image, rest_of_data_tuple)
+                    # then we would use .map_tuple(user_transform, ...)
+                    # For now, let's assume imagehandler("torchrgb") produces a dict.
+                    print(f"Warning: Transform provided but no standard image key (jpg, png, etc.) found in sample: {sample.keys()}")
+                return sample
+            pipeline = pipeline.map(apply_transform)
+
+        # Optionally convert dictionary samples to tuples
+        if 'output_tuple_keys' in processed_constructor_params:
+            tuple_keys = processed_constructor_params['output_tuple_keys']
+            if isinstance(tuple_keys, list) and all(isinstance(k, str) for k in tuple_keys):
+                pipeline = pipeline.to_tuple(*tuple_keys)
+            else:
+                print("Warning: 'output_tuple_keys' was provided but is not a list of strings. Ignoring.")
+        elif 'output_image_key' in processed_constructor_params and 'output_label_key' in processed_constructor_params:
+            image_key = processed_constructor_params['output_image_key']
+            label_key = processed_constructor_params['output_label_key']
+            if isinstance(image_key, str) and isinstance(label_key, str):
+                pipeline = pipeline.to_tuple(image_key, label_key)
+            else:
+                print("Warning: 'output_image_key' or 'output_label_key' provided but are not strings. Ignoring tuple conversion.")
+                
+        return pipeline
+    elif dataset_type in DATASET_CLASS_DICT:
         dataset_class = DATASET_CLASS_DICT[dataset_type]
         # Remove transform_params if transform object was created, to avoid passing both
         if 'transform' in processed_constructor_params and 'transform_params' in processed_constructor_params:
