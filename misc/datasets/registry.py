@@ -1,16 +1,20 @@
-# model/datasets/registry.py
+# misc/datasets/registry.py
 from torch.utils.data import Dataset
 from torchvision import transforms
-from torchvision import datasets as torchvision_datasets # For easier access
-import webdataset
+from torchvision import datasets as torchvision_datasets 
+import webdataset # Make sure this is installed
+from torch.utils.data.datapipes.datapipe import IterDataPipe, MapDataPipe # For type checking
+import os
+import json
+
+from torchdistill.datasets import util as dataset_util # For build_transform if needed for legacy paths
 
 
 DATASET_CLASS_DICT = dict()
-DATASET_FUNC_DICT = dict() # For functions that return dataset instances
+DATASET_FUNC_DICT = dict() 
+
 def parse_transform_config_list(transform_config_list: list):
-    """
-    Parses a list of transform configurations from YAML into a torchvision.transforms.Compose object.
-    """
+    # ... (your existing parse_transform_config_list logic) ...
     if transform_config_list is None:
         return None
         
@@ -19,24 +23,12 @@ def parse_transform_config_list(transform_config_list: list):
         t_type = tc_entry['type']
         t_params = tc_entry.get('params', {})
         
-        if t_type == 'RandomCrop':
-            active_transforms.append(transforms.RandomCrop(**t_params))
-        elif t_type == 'RandomResizedCrop':
-            active_transforms.append(transforms.RandomResizedCrop(**t_params))
-        elif t_type == 'RandomHorizontalFlip':
-            active_transforms.append(transforms.RandomHorizontalFlip(**t_params))
-        elif t_type == 'ToTensor':
-            active_transforms.append(transforms.ToTensor()) # Usually no params needed from YAML for this
-        elif t_type == 'Normalize':
-            active_transforms.append(transforms.Normalize(**t_params))
-        elif t_type == 'Resize':
-            active_transforms.append(transforms.Resize(**t_params))
-        elif t_type == 'CenterCrop':
-            active_transforms.append(transforms.CenterCrop(**t_params))
-        # Add more torchvision transforms as needed
+        if hasattr(transforms, t_type):
+            active_transforms.append(getattr(transforms, t_type)(**t_params))
         else:
             raise ValueError(f"Unsupported transform type in YAML: {t_type}")
     return transforms.Compose(active_transforms)
+
 def register_dataset_class(cls):
     DATASET_CLASS_DICT[cls.__name__] = cls
     return cls
@@ -53,96 +45,129 @@ def get_dataset(config: dict) -> Dataset:
     if dataset_type is None:
         raise ValueError(f"Dataset configuration must include a 'type' field. Config: {config}")
 
-    dataset_params_config = config.get('params', {}) # Original params from YAML for this level
+    dataset_params_config = config.get('params', {})
     
     processed_constructor_params = {}
     for key, value in dataset_params_config.items():
         if key == 'original_dataset' and isinstance(value, dict) and 'type' in value:
-            # This is the nested 'original_dataset' for wrappers like LabelChunkedTaskDataset
-            processed_constructor_params[key] = get_dataset(value) # Recursive call
-        elif key == 'named_datasets' and isinstance(value, dict): # For MultiSourceTaskDataset
+            processed_constructor_params[key] = get_dataset(value) 
+        elif key == 'named_datasets' and isinstance(value, dict): 
             processed_named_datasets = {}
             for task_name, dataset_conf_for_task in value.items():
                 if isinstance(dataset_conf_for_task, dict) and 'type' in dataset_conf_for_task:
                     processed_named_datasets[task_name] = get_dataset(dataset_conf_for_task)
-                else: # Should already be an instance if not a config dict
+                else: 
                     processed_named_datasets[task_name] = dataset_conf_for_task 
             processed_constructor_params[key] = processed_named_datasets
-        elif key == 'transform' and isinstance(value, dict) and '_target_' in value and 'config' in value:
-            # Handle the specific transform structure: {'_target_': ..., 'config': [list_of_transform_dicts]}
-            # Assuming 'config' key holds the list of transform parameters
-            print(f"DEBUG: Parsing transform config for key '{key}'")
+        elif key == 'transform' and isinstance(value, dict) and '_target_' in value and value['_target_'] == 'misc.datasets.registry.parse_transform_config_list' and 'config' in value:
             transform_list_config = value.get('config', [])
             processed_constructor_params[key] = parse_transform_config_list(transform_list_config)
-        elif key == 'transform_params' and isinstance(value, list): # Legacy or direct list of transform configs
-            print(f"DEBUG: Parsing transform_params list directly for key '{key}'")
-            processed_constructor_params['transform'] = parse_transform_config_list(value) # Store as 'transform'
+        elif key == 'transform_params' and isinstance(value, list): # Legacy torchdistill direct list
+             # This path should ideally be updated in YAMLs to use the _target_ structure for clarity
+            processed_constructor_params['transform'] = dataset_util.build_transform({'transform_params': value})
         else:
             processed_constructor_params[key] = value
 
-    # After processing all params:
     if dataset_type == 'WebDataset':
-        # Ensure 'url' or 'urls' is present
         if 'url' not in processed_constructor_params and 'urls' not in processed_constructor_params:
             raise ValueError("WebDataset config must include 'url' or 'urls' parameter.")
         
-        urls = processed_constructor_params.get('urls', processed_constructor_params.get('url'))
-        pipeline = webdataset.WebDataset(urls)
-        pipeline = pipeline.decode(webdataset.decode.imagehandler("torchrgb"))
+        urls = processed_constructor_params.pop('urls', processed_constructor_params.pop('url'))
+        info_json_path = processed_constructor_params.pop('info_json_path', None)
+        split_name = processed_constructor_params.pop('split_name', None) # e.g. 'train', 'validation'
+        # 'transform' should already be processed into a Compose object if it was in params
+        user_transform = processed_constructor_params.pop('transform', None) 
 
-        if 'transform' in processed_constructor_params and processed_constructor_params['transform'] is not None:
-            user_transform = processed_constructor_params['transform']
-            def apply_transform(sample):
-                # Common image extensions, add more if needed
-                img_keys = ['jpg', 'png', 'jpeg', 'ppm', 'tif', 'tiff', 'bmp']
-                applied = False
-                for key in img_keys:
-                    if key in sample:
-                        sample[key] = user_transform(sample[key])
-                        applied = True
+        length = None
+        if info_json_path and split_name:
+            expanded_info_path = os.path.expanduser(info_json_path)
+            if os.path.exists(expanded_info_path):
+                try:
+                    with open(expanded_info_path, 'r') as f:
+                        info_data = json.load(f)
+                    # Expected format: {"splits": {"train": {"num_samples": X}, "validation": {"num_samples": Y}}}
+                    length = info_data.get("splits", {}).get(split_name, {}).get("num_samples")
+                    if length:
+                        logger.info(f"Using length {length} from {expanded_info_path} for split '{split_name}'.")
+                    else:
+                        logger.warning(f"Could not find num_samples for split '{split_name}' in {expanded_info_path}. Length will be estimated by WebDataset if possible.")
+                except Exception as e:
+                    logger.warning(f"Could not read or parse info_json_path '{expanded_info_path}': {e}")
+            else:
+                logger.warning(f"info_json_path '{expanded_info_path}' does not exist.")
+        else:
+            logger.warning("info_json_path or split_name not provided for WebDataset. Length might not be available for DataLoader.")
+
+        pipeline = [webdataset.SimpleShardList(urls)]
+        # Add shuffling and tarfile_to_samples from WebDataset standard recommendations
+        # These are often done by WebDataset itself or helper functions.
+        # For torchdistill DataLoader, an IterableDataset is fine.
+        # pipeline.extend([
+        #     webdataset.split_by_worker, # if using multiple workers
+        #     webdataset.tarfile_to_samples(), # Decodes samples from tar
+        # ])
+        # Decoding specific keys. 'autodecode' can simplify this.
+        # imagehandler("torchrgb") converts to PIL, then to RGB, then to Tensor
+        # If specific keys and decoders are needed:
+        # pipeline.append(webdataset.decode(webdataset.imagehandler("torchrgb"), json_handler, ...))
+        # Assuming autodecode handles common image formats to PIL/Tensor and labels.
+        # The `image_key` and `label_key` in `LabelChunkedTaskDataset` will then pick these up.
+        pipeline = webdataset.WebDataset(urls) # This handles sharding and tar reading
+
+        if length is not None:
+             pipeline = pipeline.with_length(length)
+        
+        # Common decoding pipeline:
+        # This assumes standard keys like '.jpg', '.cls' in your tars.
+        # Adjust image_decoder and label_decoder as needed.
+        # webdataset.autodecode.imagehandler("torchrgb") first Tries to decode to PIL, then converts to RGB, then to Tensor if 'torch' is in the string.
+        # It will use the extension of the file in the tar.
+        # So, if your tar has 'sample.jpg' and 'sample.cls', and LabelChunkedTaskDataset uses image_key='jpg', label_key='cls'
+        pipeline = pipeline.decode(webdataset.autodecode.imagehandler("torchrgb"))
+        
+        # Apply user-defined transforms (like Normalize, RandomCrop) after initial decoding
+        if user_transform:
+            # WebDataset samples are dicts. Transform needs to operate on the image within the dict.
+            # Assuming the image key is 'jpg', 'png', or similar from the tar.
+            # The image_key for LabelChunkedTaskDataset will be used *after* this transform
+            # if this transform doesn't change the key.
+            # It's common that `imagehandler` produces a key like 'jpg' or 'png'.
+            def apply_transform_to_dict_image(sample):
+                # Try common image keys that imagehandler might produce
+                img_keys_to_try = ['jpg', 'png', 'jpeg', 'ppm', 'img', 'image']
+                transformed = False
+                for ik in img_keys_to_try:
+                    if ik in sample:
+                        sample[ik] = user_transform(sample[ik])
+                        transformed = True
                         break
-                if not applied:
-                    # This might happen if the image is not under a standard key
-                    # Or if the sample is not a dict (e.g. already a tuple)
-                    # For now, we'll log a warning if a transform was provided but not applied
-                    # Or, if webdataset.decode.imagehandler already returns (image, rest_of_data_tuple)
-                    # then we would use .map_tuple(user_transform, ...)
-                    # For now, let's assume imagehandler("torchrgb") produces a dict.
-                    print(f"Warning: Transform provided but no standard image key (jpg, png, etc.) found in sample: {sample.keys()}")
+                if not transformed:
+                    logger.warning(f"No common image key found in WebDataset sample to apply transform. Keys: {sample.keys()}")
                 return sample
-            pipeline = pipeline.map(apply_transform)
-
-        # Optionally convert dictionary samples to tuples
-        if 'output_tuple_keys' in processed_constructor_params:
-            tuple_keys = processed_constructor_params['output_tuple_keys']
-            if isinstance(tuple_keys, list) and all(isinstance(k, str) for k in tuple_keys):
-                pipeline = pipeline.to_tuple(*tuple_keys)
-            else:
-                print("Warning: 'output_tuple_keys' was provided but is not a list of strings. Ignoring.")
-        elif 'output_image_key' in processed_constructor_params and 'output_label_key' in processed_constructor_params:
-            image_key = processed_constructor_params['output_image_key']
-            label_key = processed_constructor_params['output_label_key']
-            if isinstance(image_key, str) and isinstance(label_key, str):
-                pipeline = pipeline.to_tuple(image_key, label_key)
-            else:
-                print("Warning: 'output_image_key' or 'output_label_key' provided but are not strings. Ignoring tuple conversion.")
-                
+            pipeline = pipeline.map(apply_transform_to_dict_image)
+        
         return pipeline
+
     elif dataset_type in DATASET_CLASS_DICT:
         dataset_class = DATASET_CLASS_DICT[dataset_type]
-        # Remove transform_params if transform object was created, to avoid passing both
-        if 'transform' in processed_constructor_params and 'transform_params' in processed_constructor_params:
-            del processed_constructor_params['transform_params']
+        # Special handling for LabelChunkedTaskDataset's original_dataset transform
+        if dataset_type == 'LabelChunkedTaskDataset' and 'original_dataset' in processed_constructor_params:
+            original_ds_instance = processed_constructor_params['original_dataset']
+            # If the original_dataset instance itself doesn't have a transform,
+            # but there was a transform_params for it in the YAML at a higher level,
+            # it should have been applied during its own get_dataset call.
+            # This part is tricky if LabelChunkedTaskDataset itself expects to apply a transform
+            # to an already instantiated dataset. Torchdistill usually expects datasets to come pre-transformed.
+            pass # Transform should have been handled when 'original_dataset' was recursively processed.
+
         return dataset_class(**processed_constructor_params)
     elif dataset_type in DATASET_FUNC_DICT:
-        # ... (same as above for transform_params if functions take it directly) ...
         return DATASET_FUNC_DICT[dataset_type](**processed_constructor_params)
     else:
         # Fallback for common torchvision datasets
         try:
-            # Ensure 'transform_params' is removed if 'transform' was generated
-            if 'transform' in processed_constructor_params and 'transform_params' in processed_constructor_params:
-                 del processed_constructor_params['transform_params']
+            if 'transform' not in processed_constructor_params and 'transform_params' in config: # Check top-level config for transform_params
+                 processed_constructor_params['transform'] = dataset_util.build_transform(config)
 
             if dataset_type == 'ImageFolder':
                 return torchvision_datasets.ImageFolder(**processed_constructor_params)
@@ -151,10 +176,7 @@ def get_dataset(config: dict) -> Dataset:
             elif dataset_type == 'CIFAR10':
                 return torchvision_datasets.CIFAR10(**processed_constructor_params)
         except Exception as e:
-            print(f"ERROR: Failed to instantiate dataset '{dataset_type}' using torchvision fallback. "
-                  f"Params: {processed_constructor_params}. Error: {e}")
-            # Potentially re-raise or handle more gracefully
-            raise e # Re-raise the error to see what went wrong during CIFAR100/ImageFolder init
-
+            logger.error(f"ERROR: Failed to instantiate dataset '{dataset_type}' using torchvision fallback. "
+                         f"Params: {processed_constructor_params}. Error: {e}")
+            raise e
         raise ValueError(f"Dataset type '{dataset_type}' not found in any known registry or torchvision fallbacks.")
-

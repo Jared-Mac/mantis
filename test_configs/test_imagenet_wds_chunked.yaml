@@ -1,0 +1,112 @@
+
+# test_configs/test_imagenet_wds_chunked.yaml
+datasets:
+  imagenet_wds_chunked_test:
+    name: 'imagenet_wds_chunked_test'
+    type: 'LabelChunkedTaskDataset'
+    splits:
+      train:
+        dataset_id: 'imagenet_wds_chunked_test/train'
+        params:
+          original_dataset:
+            type: 'WebDataset' 
+            params:
+              url: "~/imagenet-1k-wds/imagenet1k-train-{0000..1024}.tar"
+              info_json_path: "/home/coder/imagenet-1k-wds/_info.json" 
+              split_name: "train"
+              transform:
+                _target_: "misc.datasets.registry.parse_transform_config_list"
+                config:
+                  - type: 'Resize'
+                    params:
+                      size: 256
+                  - type: 'CenterCrop'
+                    params:
+                      size: [ 224, 224 ]
+                  # ToTensor is usually handled by imagehandler("torchrgb") in WebDataset decoding
+                  # - type: 'ToTensor'
+                  #   params: {}
+                  - type: 'Normalize'
+                    params:
+                      mean: [ 0.485, 0.456, 0.406 ]
+                      std: [ 0.229, 0.224, 0.225 ]
+          image_key: 'jpg' 
+          label_key: 'cls' 
+          task_configs:
+            # Task 0: Various Animals (Birds, Insects, Fish, Mammals)
+            # ~Classes 0-397. Includes fish, birds, insects, amphibians, reptiles, mammals.
+            - task_id: 0 
+              original_labels: { range: [0, 398] } 
+            # Task 1: Human-made Structures & Artifacts
+            # ~Classes 400-800. Includes vehicles, furniture, buildings, tools, clothing etc.
+            - task_id: 1
+              original_labels: { range: [401, 895] } # Adjusted slightly for some distinction
+            # Task 2: Natural Scenery & Plants
+            # ~Classes 900+. Includes geological formations, plants, fungi.
+            - task_id: 2
+              original_labels: { range: [919, 980] }
+            # Task 3: Food & Consumables 
+            # ~Classes mostly >920 but scattered. Taking a representative chunk + some others.
+            - task_id: 3
+              original_labels: { range: [923, 963] } # Vegetables, fruits, dishes
+            # --- Example of Overlapping Task (Optional) ---
+            # Task 4: Domestic Animals (Overlaps with Task 0)
+            # Includes many dogs (151-268) and cats (281-285).
+            - task_id: 4
+              original_labels: { range: [151, 290] }
+
+          default_task_id: -1
+          default_task_specific_label: -1
+      validation: # Added validation split
+        dataset_id: 'imagenet_wds_chunked_test/validation'
+        params:
+          original_dataset:
+            type: 'WebDataset'
+            params:
+              url: "~/imagenet-1k-wds/imagenet1k-validation-{00..64}.tar" # Placeholder URL for val, adjust if needed
+              info_json_path: "/home/coder/imagenet-1k-wds/_info.json"
+              split_name: "validation" # Important: use 'validation' split
+              transform:
+                _target_: "misc.datasets.registry.parse_transform_config_list"
+                config:
+                  - type: 'Resize'
+                    params:
+                      size: 256
+                  - type: 'CenterCrop'
+                    params:
+                      size: [ 224, 224 ]
+                  - type: 'Normalize'
+                    params:
+                      mean: [ 0.485, 0.456, 0.406 ]
+                      std: [ 0.229, 0.224, 0.225 ]
+          image_key: 'jpg'
+          label_key: 'cls'
+          task_configs: # Using the same task definitions as train
+            - task_id: 0 
+              original_labels: { range: [0, 398] } 
+            - task_id: 1
+              original_labels: { range: [401, 895] }
+            - task_id: 2
+              original_labels: { range: [919, 980] }
+            - task_id: 3
+              original_labels: { range: [923, 963] }
+            - task_id: 4
+              original_labels: { range: [151, 290] }
+          default_task_id: -1
+          default_task_specific_label: -1
+
+models: # Added model configurations
+  shared_stem:
+    type: 'SharedInputStem' # Not strictly used by a 'get_module' here, but for convention
+    params:
+      # in_channels is 3 (RGB), set in script
+      initial_out_channels: 64
+      num_stem_layers: 3
+      final_stem_channels: 128
+  task_predictor:
+    type: 'TaskProbabilityModel' # Not strictly used by a 'get_module' here
+    params:
+      # input_channels_from_stem: set dynamically from shared_stem.get_output_channels()
+      # output_cond_signal_dim: set dynamically from dataset's num_defined_tasks
+      hidden_dims: [64, 32, 16]
+      dropout_rate: 0.1

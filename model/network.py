@@ -52,76 +52,29 @@ class MockTeacher(nn.Module):
 
 
 class NetworkWithCompressionModule(AnalyzableModule):
-    """
-
-    """
-
     def __init__(self,
-                 compression_module: CompressionModule,
-                 backbone,
-                 analysis_config=None):
-        if analysis_config is None:
-            analysis_config = dict()
-        super(NetworkWithCompressionModule, self).__init__(analysis_config.get("analyzers_config", list()))
+                 compression_module, # Instantiated compression module
+                 backbone, # Instantiated backbone
+                 analysis_config=None): # analysis_config for THIS AnalyzableModule
+        super().__init__(analysis_config.get("analyzers_config", []) if analysis_config else [])
         self.compression_module = compression_module
         self.backbone = backbone
-        self.analyze_after_compress = analysis_config.get("analyze_after_compress", False)
+        self.analyze_after_compress = analysis_config.get("analyze_after_compress", False) if analysis_config else False
         self.compressor_updated = False
         self.quantization_stage = None
+        self.tokenizer = Tokenizer() # Generic tokenizer, or make it configurable
 
-    def activate_analysis(self):
-        self.activated_analysis = True
-        logger.info("Activated Analyzing Compression Module")
+    def forward_compress(self): # Renamed for clarity vs. model.forward()
+        return self.activated_analysis and self.compressor_updated and not self.training
 
-    def deactivate_analysis(self):
-        self.activated_analysis = False
-        logger.info("Deactivated Analyzing Compression Module")
-
-    def forward(self, x):
+    def forward(self, x, **kwargs): # Add **kwargs for flexibility (e.g. targets for training)
         raise NotImplementedError
 
     def update(self, force=False):
+        logger.info("Updating NetworkWithCompressionModule (calling compression_module.update)")
         updated = self.compression_module.update(force=force)
-        self.compressor_updated = updated
-        self.compressor_updated = True
+        self.compressor_updated = updated # Or True if update was called
         return updated
-
-    def compress(self, obj):
-        return self.compression_module.compress(obj)
-
-    def decompress(self, compressed_obj):
-        return self.compression_module.decompress(compressed_obj)
-
-    def load_state_dict(self, state_dict, **kwargs):
-        compression_module_state_dict = OrderedDict()
-        for key in list(state_dict.keys()):
-            if key.startswith('compression_module.'):
-                compression_module_state_dict[key.replace('compression_module.', '', 1)] = state_dict[key]
-
-        self.compression_module.load_state_dict(compression_module_state_dict)
-        super().load_state_dict(state_dict, strict=False)
-
-    def get_quant_device(self):
-        return self.compression_module.quantization_config.get("quant_device")
-
-    def head_quantized(self):
-        return self.quantization_stage == 'ready'
-
-    def prepare_quantization(self):
-        pass
-
-    def apply_quantization(self):
-        if self.quantization_stage == 'ready':
-            logger.info("Already applied quantization")
-            return
-        self.compression_module.apply_quantization()
-        self.quantization_stage = 'ready'
-        logger.info("Applied quantization to head")
-
-    def quantize_entropy_bottleneck(self):
-        self.compression_module.entropy_bottleneck.to("cpu")
-
-
 @register_model_class
 class SplittableClassifierWithCompressionModule(NetworkWithCompressionModule):
     """
@@ -316,17 +269,23 @@ class FiLMedNetworkWithSharedStem(NetworkWithCompressionModule):
                  compression_module_config,
                  backbone_config,
                  reconstruction_layer_for_backbone_config=None,
-                 analysis_config_parent=None):
-        
-        _shared_stem_temp = SharedInputStem(**shared_stem_config["params"])
-        stem_output_channels = _shared_stem_temp.get_output_channels()
+                 analysis_config_parent=None): # For NetworkWithCompressionModule's analyzers
+
+        # Instantiate components directly
+        self.shared_stem = SharedInputStem(**shared_stem_config["params"])
+        stem_output_channels = self.shared_stem.get_output_channels()
 
         actual_task_prob_model_config_params = task_probability_model_config["params"].copy()
         actual_task_prob_model_config_params["input_channels_from_stem"] = stem_output_channels
-        _task_probability_model_temp = TaskProbabilityModel(**actual_task_prob_model_config_params)
-        expected_film_cond_dim = _task_probability_model_temp.get_output_dim()
+        # output_cond_signal_dim might be set dynamically based on dataset info later if not in YAML
+        self.task_probability_model = TaskProbabilityModel(**actual_task_prob_model_config_params)
         
-        actual_analysis_config_for_g_a = compression_module_config["params"]["analysis_config"]
+        expected_film_cond_dim = self.task_probability_model.get_output_dim()
+        
+        # Deep copy compressor config to modify it safely
+        current_compression_module_config = yaml_util.load_yaml_file(yaml_util.dumps(compression_module_config)) # cheap deepcopy
+        
+        actual_analysis_config_for_g_a = current_compression_module_config["params"]["analysis_config"]
         actual_analysis_config_for_g_a["params"]["input_channels_from_stem"] = stem_output_channels
         
         if "film_cond_dim" not in actual_analysis_config_for_g_a["params"] or \
@@ -340,75 +299,111 @@ class FiLMedNetworkWithSharedStem(NetworkWithCompressionModule):
             )
 
         compressor_instance = get_custom_compression_module(
-            compression_module_config["name"],
-            **compression_module_config["params"]
+            current_compression_module_config["name"],
+            **current_compression_module_config["params"]
         )
         backbone_instance = get_model(model_name=backbone_config["name"], **backbone_config["params"])
 
         super().__init__(compressor_instance, backbone_instance, analysis_config=analysis_config_parent)
-
-        self.shared_stem = _shared_stem_temp
-        self.task_probability_model = _task_probability_model_temp
         
+        # Reconstruction layer handling
         if reconstruction_layer_for_backbone_config and reconstruction_layer_for_backbone_config.get("name"):
             reconstruction_layer_instance = get_layer(
                 reconstruction_layer_for_backbone_config["name"],
                 **reconstruction_layer_for_backbone_config.get("params", {})
             )
+            # If g_s has a 'final_layer' attribute, it means g_s itself can apply the final recon.
+            # Otherwise, this network applies it after g_s.
             if hasattr(self.compression_module.g_s, 'final_layer'):
                 logger.info(f"Setting final_layer of g_s to {reconstruction_layer_for_backbone_config['name']}")
                 self.compression_module.g_s.final_layer = reconstruction_layer_instance
-                self.reconstruction_for_backbone = nn.Identity()
+                self.reconstruction_for_backbone = nn.Identity() # g_s handles it
             else:
                 self.reconstruction_for_backbone = reconstruction_layer_instance
         else:
             self.reconstruction_for_backbone = nn.Identity()
 
-    def forward(self, x, targets=None):
+
+    def forward(self, x, targets=None): # `targets` might be used by some advanced scenarios, but typically not by model.forward
         stem_features = self.shared_stem(x)
         conditioning_signal = self.task_probability_model(stem_features)
         
-        reconstructed_features_from_compressor_output = self.compression_module(stem_features, conditioning_signal=conditioning_signal)
+        reconstructed_features_from_compressor_output = None
+        if self.forward_compress(): # Inference with actual compression
+            compressed_obj = self.compression_module.compress(stem_features, conditioning_signal=conditioning_signal)
+            if self.activated_analysis:
+                self.analyze(compressed_obj, img_shape=x.shape) 
+            reconstructed_features_from_compressor_output = self.compression_module.decompress(compressed_obj)
+        else: # Training or regular forward pass (quantization noise added if training)
+            reconstructed_features_from_compressor_output = self.compression_module(
+                stem_features, 
+                conditioning_signal=conditioning_signal,
+                return_likelihoods=self.training # Request likelihoods only if training (for BppLoss)
+            )
         
+        # Handle if compression_module returns (output, likelihoods)
         if isinstance(reconstructed_features_from_compressor_output, tuple) and \
            len(reconstructed_features_from_compressor_output) > 0 and \
            isinstance(reconstructed_features_from_compressor_output[0], torch.Tensor):
+            # Assume first element is the feature, rest could be likelihoods etc.
             reconstructed_features = reconstructed_features_from_compressor_output[0]
+            # likelihoods_y = reconstructed_features_from_compressor_output[1].get('y') if len(reconstructed_features_from_compressor_output) > 1 and isinstance(reconstructed_features_from_compressor_output[1], dict) else None
         else:
             reconstructed_features = reconstructed_features_from_compressor_output
-           
-        features_for_backbone = reconstructed_features
-        if not isinstance(self.reconstruction_for_backbone, nn.Identity) and \
-           not (hasattr(self.compression_module.g_s, 'final_layer') and \
-                isinstance(self.compression_module.g_s.final_layer, type(self.reconstruction_for_backbone))):
-            features_for_backbone = self.reconstruction_for_backbone(reconstructed_features)
+            # likelihoods_y = None
             
-        main_task_output = self.backbone(self.tokenizer(features_for_backbone))
-           
-        if self.training:
-            return {"main_output": main_task_output,
-                    "conditioning_signal_preview": conditioning_signal}
-        return main_task_output
-@register_model_func
-def splittable_network_with_compressor_with_shared_stem(
-    shared_stem_config,
-    task_probability_model_config,
-    compression_module_config,
-    backbone_config,
-    reconstruction_layer_for_backbone_config=None,
-    analysis_config_parent=None,
-    network_type="FiLMedNetworkWithSharedStem"
-):
-    network = get_model(
-        model_name=network_type,
-        shared_stem_config=shared_stem_config,
-        task_probability_model_config=task_probability_model_config,
-        compression_module_config=compression_module_config,
-        backbone_config=backbone_config,
-        reconstruction_layer_for_backbone_config=reconstruction_layer_for_backbone_config,
-        analysis_config_parent=analysis_config_parent
-    )
-    return network
+        features_for_backbone = self.reconstruction_for_backbone(reconstructed_features)
+        
+        # Tokenizer might be part of the backbone's patch_embed or applied explicitly here
+        # Assuming backbone expects tokenized input if it's a Transformer type without its own patch_embed.
+        # If backbone is CNN based and skip_embed=True, it expects feature maps.
+        # This needs to be consistent with backbone_config.
+        # For ResNet with skip_embed=True, it expects feature maps.
+        # For ViT types, they usually have their own patch_embed unless skip_embed means something different.
+        # Let's assume self.tokenizer handles img->token if needed, or is Identity.
+        # If backbone.patch_embed exists and is not Identity, it will handle tokenization.
+        
+        # If backbone is a typical timm model, it has its own forward.
+        # If reconstruction_for_backbone output is C,H,W and backbone needs tokens, self.tokenizer is used.
+        # If backbone needs C,H,W, self.tokenizer should be Identity.
+        # For ResNet18 with skip_embed=True, it takes (B, C, H, W) where C is usually 64 for layer1.
+        # So, self.tokenizer should be nn.Identity() in that case.
+        # Making self.tokenizer part of the class, initialized based on backbone type or config.
+        # For now, if features_for_backbone is 4D, and backbone is a typical timm model, it should work.
+        # If backbone expects 3D (B, N, C) then tokenization is needed.
+        
+        # Let's assume `self.tokenizer` is nn.Identity() if the backbone's first layer (e.g. resnet.layer1) expects 4D tensor.
+        # And it's a real Tokenizer if the backbone (e.g. ViT without patch_embed) expects 3D tensor.
+        # For ResNet18 backbone with skip_embed=True, input to layer1 is 4D.
+        # If self.tokenizer is Tokenizer(), it converts 4D to 3D. This depends on backbone specifics.
+        # The provided YAML uses resnet18 with skip_embed=True, so its layer1 expects 4D. Tokenizer should be Identity.
+        # For safety, we'll call a general self.tokenizer here. It should be nn.Identity for ResNet scenario.
+        
+        # Check dimensionality for tokenizer
+        if features_for_backbone.dim() == 4 and self.backbone.__class__.__name__ not in ["ResNet", "ConvNeXt"]: # Add other CNNs
+             # Assuming transformers take 3D input after tokenizer
+            tokenized_features = self.tokenizer(features_for_backbone)
+            main_task_output = self.backbone(tokenized_features)
+        else: # CNNs usually take 4D
+            main_task_output = self.backbone(features_for_backbone)
+            
+        # For loss calculation, the training script will expect a dictionary.
+        # For GeneralizedCustomLoss, the paths in its `params` section will try to extract these.
+        output_dict = {"main_output": main_task_output, 
+                       "conditioning_signal_preview": conditioning_signal}
+        
+        # Include likelihoods for BppLoss during training if returned by compression_module
+        # if self.training and likelihoods_y is not None:
+        #     # This is tricky because BppLoss usually hooks the entropy_bottleneck directly.
+        #     # If compression_module already returns likelihoods for the *entire* set (y, z etc),
+        #     # then BppLoss could be configured to use this output.
+        #     # However, standard BppLoss hooks EB.
+        #     # For now, let's rely on GCL hooks for EB.
+        #     pass
+
+        return output_dict
+
+
 @register_model_func
 def splittable_network_with_compressor_with_shared_stem(
     shared_stem_config, 
@@ -417,11 +412,25 @@ def splittable_network_with_compressor_with_shared_stem(
     backbone_config,
     reconstruction_layer_for_backbone_config=None, 
     analysis_config_parent=None, 
-    network_type="FiLMedHFactorizedPriorCompressionModule" 
+    network_type="FiLMedNetworkWithSharedStem" # Default to the new FiLMed one
 ):
-    
-    network = get_model(
-        model_name=network_type, 
+    if network_type == "FiLMedNetworkWithSharedStem":
+        network_class = FiLMedNetworkWithSharedStem
+    # Add other types here if needed, e.g., "SplittableNetworkWithSharedStem" for a non-FiLMed version
+    # elif network_type == "OriginalSplittableNetworkWithSharedStem":
+    #     network_class = SplittableNetworkWithSharedStem # Assume this is defined elsewhere
+    else:
+        raise ValueError(f"Unknown network_type for splittable_network: {network_type}")
+
+    # Dynamically adjust task_probability_model_config's output_cond_signal_dim
+    # This ideally should happen after dataset is loaded and info is available.
+    # For now, the YAML might need to provide a placeholder or the actual value.
+    # If dataset info (num_task_chunks) is available here, we could override.
+    # This is a bit tricky as model init usually precedes full dataset parsing.
+    # The PhasedTrainingBox or main script might need to pass this info if it's truly dynamic.
+    # For now, assume YAML value for output_cond_signal_dim is used.
+
+    network = network_class(
         shared_stem_config=shared_stem_config,
         task_probability_model_config=task_probability_model_config, 
         compression_module_config=compression_module_config,
