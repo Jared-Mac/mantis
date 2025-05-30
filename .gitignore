@@ -1,0 +1,16 @@
+.venv/
+mantis-env/
+
+wandb/
+saved_checkpoints/
+logs/
+results/
+data/
+# PyTorch
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+

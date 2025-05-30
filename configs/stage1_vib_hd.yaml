@@ -1,0 +1,165 @@
+models:
+  teacher_model:
+    key: 'resnet50'
+    kwargs:
+      num_classes: 1000
+    _weights: !import_get
+      key: 'torchvision.models.resnet.ResNet50_Weights'
+    frozen_modules: [] # All parameters frozen by default for teacher
+    forward_hook:
+      input: []
+      output: ['layer3'] # Extract features from layer3 for head distillation
+
+  student_model:
+    key: 'mantis_stage1'
+    kwargs:
+      client_params:
+        stem_channels: 128
+        encoder_channels: 256
+        num_encoder_blocks: 3
+      decoder_params:
+        input_channels: 256
+        output_channels: 1024  # Match teacher layer3 output channels
+        num_blocks: 3
+      vib_channels: 256
+    forward_hook:
+      input: []
+      output: ['g_s_output', 'z_likelihoods']
+
+datasets:
+  train:
+    key: '!import_call'
+    _init:
+      module_path: 'torchvision.datasets'
+      class_name: 'ImageNet'
+    kwargs:
+      root: './data/imagenet'
+      split: 'train'
+      transform: !import_call
+        _init:
+          module_path: 'torchvision.transforms'
+          class_name: 'Compose'
+        kwargs:
+          transforms:
+            - !import_call
+                _init:
+                  module_path: 'torchvision.transforms'
+                  class_name: 'RandomResizedCrop'
+                kwargs:
+                  size: 224
+            - !import_call
+                _init:
+                  module_path: 'torchvision.transforms'
+                  class_name: 'RandomHorizontalFlip'
+            - !import_call
+                _init:
+                  module_path: 'torchvision.transforms'
+                  class_name: 'ToTensor'
+            - !import_call
+                _init:
+                  module_path: 'torchvision.transforms'
+                  class_name: 'Normalize'
+                kwargs:
+                  mean: [0.485, 0.456, 0.406]
+                  std: [0.229, 0.224, 0.225]
+
+  val:
+    key: '!import_call'
+    _init:
+      module_path: 'torchvision.datasets'
+      class_name: 'ImageNet'
+    kwargs:
+      root: './data/imagenet'
+      split: 'val'
+      transform: !import_call
+        _init:
+          module_path: 'torchvision.transforms'
+          class_name: 'Compose'
+        kwargs:
+          transforms:
+            - !import_call
+                _init:
+                  module_path: 'torchvision.transforms'
+                  class_name: 'Resize'
+                kwargs:
+                  size: 256
+            - !import_call
+                _init:
+                  module_path: 'torchvision.transforms'
+                  class_name: 'CenterCrop'
+                kwargs:
+                  size: 224
+            - !import_call
+                _init:
+                  module_path: 'torchvision.transforms'
+                  class_name: 'ToTensor'
+            - !import_call
+                _init:
+                  module_path: 'torchvision.transforms'
+                  class_name: 'Normalize'
+                kwargs:
+                  mean: [0.485, 0.456, 0.406]
+                  std: [0.229, 0.224, 0.225]
+
+train:
+  num_epochs: 100
+  batch_size: 64
+  log_freq: 100
+  
+  optimizer:
+    key: 'AdamW'
+    kwargs:
+      lr: 0.0001
+      weight_decay: 0.01
+
+  scheduler:
+    key: 'CosineAnnealingLR'
+    kwargs:
+      T_max: 100
+      eta_min: 0.00001
+
+  criterion:
+    key: 'WeightedSumLoss'
+    kwargs:
+      sub_terms:
+        hd_loss: # Head distillation loss
+          criterion:
+            key: 'MSELoss'
+            kwargs:
+              reduction: 'mean'
+          criterion_wrapper:
+            key: 'SimpleLossWrapper'
+            kwargs:
+              input:
+                is_from_teacher: False
+                module_path: '.'
+                io: 'g_s_output'
+              target:
+                is_from_teacher: True
+                module_path: 'layer3'
+                io: 'output'
+          weight: 1.0
+
+        rate_loss: # VIB rate term
+          criterion:
+            key: 'vib_loss_stage1'
+            kwargs:
+              num_pixels_placeholder: 65536  # 256*256 placeholder
+          criterion_wrapper:
+            key: 'SimpleLossWrapper'
+            kwargs:
+              input:
+                is_from_teacher: False
+                module_path: '.'
+                io: 'z_likelihoods'
+              target:
+                uses_label: False
+          weight: 0.01  # beta_stage1
+
+test:
+  test_data_loader_type: 'val'
+  log_freq: 1000
+
+save:
+  checkpoint_interval: 10
+  checkpoint_path: './saved_checkpoints/stage1/' 
