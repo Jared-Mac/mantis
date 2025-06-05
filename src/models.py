@@ -1,10 +1,11 @@
+# file_path: src/models.py
 import torch
 import torch.nn as nn
 from client.stem import SharedStem
 from client.task_detector import TaskDetector
 from client.film_generator import FiLMGenerator
 from client.filmed_encoder import FiLMedEncoder
-from server.decoders_tails import GenericDecoder, TaskSpecificDecoder, TaskSpecificTail
+from server.decoders_tails import GenericDecoderStage1, TaskSpecificDecoder, TaskSpecificTail 
 from vib import VIBBottleneck
 
 
@@ -49,41 +50,28 @@ class MantisStage1Client(nn.Module):
 class MantisStage1(nn.Module):
     """
     Complete MANTiS model for Stage 1 training.
-    
     Includes client encoder, VIB bottleneck, and generic decoder for head distillation.
     """
-    
     def __init__(self, client_params, decoder_params, vib_channels):
         super().__init__()
-        
         self.client_encoder = MantisStage1Client(**client_params)
         self.vib_bottleneck = VIBBottleneck(vib_channels)
-        self.generic_decoder = GenericDecoder(**decoder_params)
-        
+        # Use the new GenericDecoderStage1
+        self.generic_decoder = GenericDecoderStage1(**decoder_params) # decoder_params will need 'num_processing_blocks'
+
     def forward(self, x):
-        """
-        Forward pass for Stage 1 training.
-        
-        Args:
-            x: Input image (B, 3, H, W)
-            
-        Returns:
-            Dictionary with outputs for loss computation
-        """
-        # Client-side encoding
         z_raw = self.client_encoder(x)
-        
-        # VIB bottleneck
         z_hat, z_likelihoods = self.vib_bottleneck(z_raw, training=self.training)
-        
-        # Server-side decoding for head distillation
         reconstructed_features = self.generic_decoder(z_hat)
         
         return {
-            "g_s_output": reconstructed_features,  # For head distillation loss
-            "z_likelihoods": {"z": z_likelihoods}  # For rate loss
+            "g_s_output": reconstructed_features,
+            "z_likelihoods": {"z": z_likelihoods},
+            # For debugging NaN:
+            "debug_z_raw_mean": z_raw.detach().mean(),
+            "debug_z_hat_mean": z_hat.detach().mean(),
+            "debug_reconstructed_features_mean": reconstructed_features.detach().mean()
         }
-
 
 class MantisClientStage2(nn.Module):
     """
@@ -111,12 +99,17 @@ class MantisClientStage2(nn.Module):
         Args:
             stage1_checkpoint_path: Path to Stage 1 checkpoint
         """
-        checkpoint = torch.load(stage1_checkpoint_path, map_location='cpu')
+        # Set weights_only=False as checkpoint contains argparse.Namespace
+        checkpoint = torch.load(stage1_checkpoint_path, map_location='cpu', weights_only=False)
         
         # Load stem weights
         stem_state_dict = {}
         encoder_state_dict = {}
         
+        # Check if model_state_dict exists
+        if 'model_state_dict' not in checkpoint:
+            raise KeyError("Checkpoint does not contain 'model_state_dict'. Make sure it's a valid model checkpoint.")
+
         for key, value in checkpoint['model_state_dict'].items():
             if key.startswith('client_encoder.stem.'):
                 new_key = key.replace('client_encoder.stem.', '')
@@ -125,7 +118,8 @@ class MantisClientStage2(nn.Module):
                 new_key = key.replace('client_encoder.encoder.', '')
                 encoder_state_dict[new_key] = value
                 
-        # Load with missing keys allowed (task detector and film generator are new)
+        # Load with missing keys allowed for encoder (FiLM params are new)
+        # strict=True for stem as its architecture should match
         self.stem.load_state_dict(stem_state_dict, strict=True)
         self.filmed_encoder.load_state_dict(encoder_state_dict, strict=False)
         
@@ -294,4 +288,4 @@ class MantisOracleStage2(MantisStage2):
             "task_predictions": p_task,  # Use ground truth
             "downstream_outputs": downstream_outputs,
             "z_film_likelihoods": {"z_film": z_film_likelihoods}
-        } 
+        }

@@ -10,39 +10,27 @@ class GenericDecoder(nn.Module):
     Mirrors the encoder's upsampling path using CompressAI layers.
     """
     
-    def __init__(self, input_channels, output_channels, num_blocks=3):
+    def __init__(self, input_channels, output_channels, num_blocks=3): # Original default
         super().__init__()
-        
-        # Upsampling blocks to mirror encoder downsampling
         self.blocks = nn.ModuleList()
-        
-        # First upsampling block
+        # First upsampling block (e.g., z: H/8 -> H/4)
         self.blocks.append(
             ResidualBlockUpsample(input_channels, output_channels, upsample=2)
         )
-        
         # Additional blocks without upsampling
-        for _ in range(num_blocks - 1):
+        for _ in range(num_blocks - 1): # This loop might change behavior based on num_blocks
             self.blocks.append(
                 ResidualBlock(output_channels, output_channels)
             )
-            
-        # Final upsampling to match teacher feature dimensions
+        # Final upsampling (e.g., H/4 -> H/2)
         self.final_upsample = ResidualBlockUpsample(output_channels, output_channels, upsample=2)
-        
+
     def forward(self, z):
-        """
-        Decode latent representation to reconstructed features.
-        
-        Args:
-            z: Latent representation (B, input_channels, H, W)
-            
-        Returns:
-            Reconstructed features for head distillation
-        """
         x = z
         for block in self.blocks:
             x = block(x)
+        # If num_blocks=1, self.blocks has one upsampler. Then final_upsample applies again.
+        # This results in z (H/8) -> block_out (H/4) -> final_out (H/2). This is the 112x112 output.
         x = self.final_upsample(x)
         return x
 
@@ -173,3 +161,38 @@ class TaskSpecificTail(nn.Module):
             
     def forward(self, x):
         return self.head(x) 
+class GenericDecoderStage1(nn.Module):
+    """
+    Revised Generic Decoder for Stage 1 Head Distillation.
+    Assumes input z_hat has the same spatial dimensions (e.g., H/8 x W/8)
+    as the target teacher features (e.g., ResNet50 layer2 output: H/8 x W/8).
+    This decoder primarily adjusts channel depth and performs some processing
+    without further net spatial upsampling.
+    """
+    def __init__(self, input_channels, output_channels, num_processing_blocks=2):
+        super().__init__()
+        
+        # Initial 1x1 convolution to map input channels to a working dimension if needed,
+        # or directly to output_channels if num_processing_blocks is 0.
+        # Using 3x3 conv for some spatial processing.
+        self.initial_conv = nn.Conv2d(input_channels, output_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn_initial = nn.BatchNorm2d(output_channels)
+        self.relu = nn.ReLU(inplace=True)
+        
+        self.processing_blocks = nn.ModuleList()
+        for _ in range(num_processing_blocks):
+            self.processing_blocks.append(
+                ResidualBlock(output_channels, output_channels) # No stride, no upsample
+            )
+            
+    def forward(self, z_hat):
+        """
+        Args:
+            z_hat: Latent representation (B, input_channels, H_latent, W_latent)
+        Returns:
+            Reconstructed features (B, output_channels, H_latent, W_latent)
+        """
+        x = self.relu(self.bn_initial(self.initial_conv(z_hat)))
+        for block in self.processing_blocks:
+            x = block(x)
+        return x

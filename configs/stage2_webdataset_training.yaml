@@ -1,0 +1,45 @@
+# configs/stage2_webdataset_training.yaml
+project:
+  save_dir: './saved_checkpoints/stage2_from_config/'
+  use_wandb: false
+  wandb_project: 'mantis-stage2'
+  wandb_run_name: null # auto-generated if null
+  wandb_tags: ['webdataset', 'from-config']
+
+data:
+  data_dir: '~/imagenet-1k-wds'
+  num_workers: 4
+  prefetch_factor: 4
+  image_size: 224 # not used in script, but good to have
+
+model:
+  stage1_checkpoint_path: './saved_checkpoints/stage1/checkpoint_epoch_4.pth' # REQUIRED - User needs to change this
+  resume_stage2_checkpoint: null # Optional path to stage2 checkpoint to resume from
+  freeze_stem: false
+  config:
+    stem_channels: 128
+    encoder_blocks: 3
+    vib_channels: 256
+    film_gen_hidden_dim: 64
+    task_detector_hidden_dim: 64
+
+training:
+  device: 'cuda'
+  num_epochs: 100
+  batch_size: 32
+  grad_accumulation_steps: 1
+  use_amp: true
+  optimizer:
+    main_lr: 0.0001
+    backbone_lr: 0.00001
+    weight_decay: 0.01
+  loss_weights:
+    lambda_task: 1.0
+    lambda_downstream: 1.0
+    beta_prime: 0.01
+
+logging_and_saving:
+  log_freq: 100
+  save_freq: 1
+  monitor_memory: true
+  profile_batches: 0 

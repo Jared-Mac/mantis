@@ -782,6 +782,5 @@ These are mostly conceptual and relate to how you structure the experiments, whi
     ```
     (Note: `torchdistill.examples.image_classification` might have moved or been updated; the typical entry point is often `torchdistill.entry.train` or similar. Please check `torchdistill` documentation for the correct training script invocation.)
 
-
-</rewritten_file>
+*For implementation - use comments sparingly*
 
