@@ -1,6 +1,6 @@
 import torch
 import torch.utils.data as data
-from torchvision.datasets import ImageFolder
+from torchvision.datasets import ImageFolder, CIFAR100, Flowers102
 from torchvision import transforms
 import os
 import json
@@ -258,4 +258,87 @@ def create_mantis_datasets(data_root, image_size=224, use_multidataset=False):
             'val': val_dataset,
             'num_tasks': len(task_definitions),
             'task_names': list(task_definitions.keys())
-        } 
+        }
+
+
+def get_cifar100_dataset(data_root, is_training=True, image_size=224, download=True):
+    """
+    Get CIFAR-100 dataset.
+
+    Args:
+        data_root: Root directory for CIFAR-100 data
+        is_training: Whether for training (applies augmentation)
+        image_size: Target image size (CIFAR-100 is 32x32, so this is for resizing)
+        download: Whether to download the dataset if not present
+
+    Returns:
+        CIFAR100 dataset object
+    """
+    if is_training:
+        transform = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.Resize(image_size), # Resize after augmentations on native size
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5071, 0.4867, 0.4408],
+                                 std=[0.2675, 0.2565, 0.2761])
+        ])
+    else:
+        transform = transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.CenterCrop(image_size), # Ensure image is exactly image_size x image_size
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5071, 0.4867, 0.4408],
+                                 std=[0.2675, 0.2565, 0.2761])
+        ])
+
+    dataset = CIFAR100(
+        root=data_root,
+        train=is_training,
+        transform=transform,
+        download=download
+    )
+    return dataset
+
+
+def get_flowers102_dataset(data_root, is_training=True, image_size=224, download=True):
+    """
+    Get Flowers102 dataset.
+
+    Args:
+        data_root: Root directory for Flowers102 data
+        is_training: Whether for training (applies augmentation)
+        image_size: Target image size
+        download: Whether to download the dataset if not present
+
+    Returns:
+        Flowers102 dataset object
+    """
+    if is_training:
+        transform = transforms.Compose([
+            transforms.RandomResizedCrop(image_size, scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.4326, 0.3801, 0.2966],  # Typical Flowers102 mean/std
+                                 std=[0.2974, 0.2414, 0.2703])
+        ])
+    else:
+        transform = transforms.Compose([
+            transforms.Resize(256), # Standard practice to resize larger first
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.4326, 0.3801, 0.2966],
+                                 std=[0.2974, 0.2414, 0.2703])
+        ])
+
+    # Flowers102 uses 'train', 'val', 'test' splits. We'll map 'train' to training and 'val' to validation.
+    split_name = 'train' if is_training else 'val'
+
+    dataset = Flowers102(
+        root=data_root,
+        split=split_name,
+        transform=transform,
+        download=download
+    )
+    return dataset

@@ -1,0 +1,171 @@
+models:
+  student_model:
+    key: 'mantis_stage2'
+    kwargs:
+      client_params:
+        stem_params:
+          input_channels: 3
+          output_channels: 128
+          num_blocks: 2
+        task_detector_params:
+          input_feat_dim: 128
+          num_tasks: 2 # MODIFIED
+          hidden_dim: 64
+        film_gen_params:
+          num_tasks: 2 # MODIFIED
+          num_filmed_layers: 3
+          channels_per_layer: [256, 256, 256] # Kept as is, related to encoder architecture
+          hidden_dim: 64
+        filmed_encoder_params:
+          input_channels: 128
+          output_channels: 256
+          num_blocks: 3
+          film_bypass: False
+      num_tasks: 2 # MODIFIED
+      decoder_params_list: # MODIFIED
+        - input_channels: 256
+          output_channels: 128
+          num_blocks: 2
+        - input_channels: 256
+          output_channels: 128
+          num_blocks: 2
+      tail_params_list: # MODIFIED
+        - task_type: 'classification'
+          input_channels: 128 # Matches decoder output_channels
+          num_classes: 100  # CIFAR100
+        - task_type: 'classification'
+          input_channels: 128 # Matches decoder output_channels
+          num_classes: 102  # Flowers102
+      vib_channels: 256
+    frozen_modules: ['client.stem'] # Freeze shared stem from Stage 1
+    forward_hook:
+      input: []
+      output: ['task_predictions', 'downstream_outputs', 'z_film_likelihoods']
+
+datasets: # MODIFIED
+  train: !import_call
+    _init:
+      module_path: 'src.registry'
+      class_name: 'get_mantis_train_dataset'
+    kwargs:
+      data_root: './data'
+      image_size: 224
+      use_multidataset: True
+  val: !import_call
+    _init:
+      module_path: 'src.registry'
+      class_name: 'get_mantis_val_dataset'
+    kwargs:
+      data_root: './data'
+      image_size: 224
+      use_multidataset: True
+
+train:
+  num_epochs: 50
+  batch_size: 32 # Consider if this needs adjustment for smaller datasets, keeping for now
+  log_freq: 100
+
+  # Load Stage 1 weights - kept as is, assuming generic stem
+  src_ckpt: './saved_checkpoints/stage1/best_model.pth'
+
+  optimizer:
+    key: 'AdamW'
+    module_wise_configs:
+      - module: 'client.filmed_encoder'
+        kwargs:
+          lr: 0.00001
+      - module: 'client.task_detector'
+        kwargs:
+          lr: 0.0001
+      - module: 'client.film_generator'
+        kwargs:
+          lr: 0.0001
+      - module: 'server_decoders'
+        kwargs:
+          lr: 0.0001
+      - module: 'server_tails'
+        kwargs:
+          lr: 0.0001
+    kwargs:
+      weight_decay: 0.01
+
+  scheduler:
+    key: 'CosineAnnealingLR'
+    kwargs:
+      T_max: 50 # Should ideally match num_epochs
+      eta_min: 0.000001
+
+  criterion:
+    key: 'WeightedSumLoss'
+    kwargs:
+      sub_terms:
+        task_detector_loss:
+          criterion:
+            key: 'BCELoss' # Assuming binary detection per task still makes sense
+            kwargs:
+              reduction: 'mean'
+          criterion_wrapper:
+            key: 'SimpleLossWrapper'
+            kwargs:
+              input:
+                is_from_teacher: False
+                module_path: '.'
+                io: 'task_predictions'
+              target:
+                uses_label: True
+                label_key: 'Y_task'
+          weight: 1.0
+
+        downstream_task_losses:
+          criterion:
+            key: 'multi_task_downstream_loss'
+            kwargs:
+              num_tasks: 2 # MODIFIED
+              task_loss_configs: # MODIFIED
+                - type: 'CrossEntropyLoss'
+                  params:
+                    reduction: 'mean'
+                - type: 'CrossEntropyLoss'
+                  params:
+                    reduction: 'mean'
+          criterion_wrapper:
+            key: 'multi_task_criterion_wrapper'
+          weight: 1.0
+
+        rate_loss_z_film:
+          criterion:
+            key: 'vib_loss_stage2'
+            kwargs:
+              num_pixels_placeholder: 65536 # This might need adjustment if image_size changes significantly from pre-training context
+          criterion_wrapper:
+            key: 'SimpleLossWrapper'
+            kwargs:
+              input:
+                is_from_teacher: False
+                module_path: '.'
+                io: 'z_film_likelihoods'
+              target:
+                uses_label: False
+          weight: 0.01
+
+test:
+  test_data_loader_type: 'val'
+  log_freq: 500
+
+save:
+  checkpoint_interval: 5
+  # Consider changing path to avoid overwriting ImageNet stage2 checkpoints
+  checkpoint_path: './saved_checkpoints/stage2_cifar_flowers/' # MODIFIED for clarity
+
+# Evaluation metrics for multi-task setting
+eval:
+  metrics:
+    - key: 'task_detection_accuracy'
+      module_path: 'src.evaluation'
+      class_name: 'TaskDetectionAccuracy'
+    - key: 'downstream_accuracy'
+      module_path: 'src.evaluation'
+      class_name: 'MultiTaskAccuracy'
+    - key: 'compression_rate'
+      module_path: 'src.evaluation'
+      class_name: 'CompressionRate'

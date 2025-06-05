@@ -21,7 +21,7 @@ from losses import (
     VIBLossStage1, VIBLossStage2, MultiTaskDownstreamLoss, 
     MultiTaskCriterionWrapper, TaskDetectorLoss, CombinedMantisLoss
 )
-from datasets import ImageNetSubgroupsDataset, MultiDatasetWrapper
+from datasets import ImageNetSubgroupsDataset, MultiDatasetWrapper, create_mantis_datasets
 
 
 # Register models
@@ -112,4 +112,51 @@ def get_imagenet_transforms(is_training=True, image_size=224):
     return _get_imagenet_transforms(is_training=is_training, image_size=image_size)
 
 
-print("MANTiS components registered with torchdistill!") 
+# New dataset constructor functions
+def get_mantis_train_dataset(data_root, image_size=224, use_multidataset=False, **kwargs):
+    """
+    Gets the MANTiS training dataset.
+
+    Args:
+        data_root: Root directory for datasets.
+        image_size: Target image size.
+        use_multidataset: Whether to use the multi-dataset setup (e.g., CIFAR100 + Flowers102)
+                          or the default ImageNet subgroups.
+        **kwargs: Additional arguments to pass to create_mantis_datasets.
+
+    Returns:
+        The training dataset object.
+    """
+    datasets_dict = create_mantis_datasets(
+        data_root=data_root,
+        image_size=image_size,
+        use_multidataset=use_multidataset,
+        **kwargs
+    )
+    return datasets_dict['train']
+
+
+def get_mantis_val_dataset(data_root, image_size=224, use_multidataset=False, **kwargs):
+    """
+    Gets the MANTiS validation dataset.
+
+    Args:
+        data_root: Root directory for datasets.
+        image_size: Target image size.
+        use_multidataset: Whether to use the multi-dataset setup (e.g., CIFAR100 + Flowers102)
+                          or the default ImageNet subgroups.
+        **kwargs: Additional arguments to pass to create_mantis_datasets.
+
+    Returns:
+        The validation dataset object.
+    """
+    datasets_dict = create_mantis_datasets(
+        data_root=data_root,
+        image_size=image_size,
+        use_multidataset=use_multidataset,
+        **kwargs
+    )
+    return datasets_dict['val']
+
+
+print("MANTiS components registered with torchdistill!")
