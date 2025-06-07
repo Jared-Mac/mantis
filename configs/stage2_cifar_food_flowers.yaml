@@ -9,10 +9,10 @@ models:
           num_blocks: 2
         task_detector_params:
           input_feat_dim: 128
-          num_tasks: 2 # MODIFIED
+          num_tasks: 3 # MODIFIED
           hidden_dim: 64
         film_gen_params:
-          num_tasks: 2 # MODIFIED
+          num_tasks: 3 # MODIFIED
           num_filmed_layers: 3
           channels_per_layer: [256, 256, 256] # Kept as is, related to encoder architecture
           hidden_dim: 64
@@ -21,8 +21,11 @@ models:
           output_channels: 256
           num_blocks: 3
           film_bypass: False
-      num_tasks: 2 # MODIFIED
+      num_tasks: 3 # MODIFIED
       decoder_params_list: # MODIFIED
+        - input_channels: 256
+          output_channels: 128
+          num_blocks: 2
         - input_channels: 256
           output_channels: 128
           num_blocks: 2
@@ -32,17 +35,20 @@ models:
       tail_params_list: # MODIFIED
         - task_type: 'classification'
           input_channels: 128 # Matches decoder output_channels
-          num_classes: 100  # CIFAR100
+          num_classes: 100  # CIFAR100 (Task 0)
         - task_type: 'classification'
           input_channels: 128 # Matches decoder output_channels
-          num_classes: 102  # Flowers102
+          num_classes: 101  # Food101 (Task 1)
+        - task_type: 'classification'
+          input_channels: 128 # Matches decoder output_channels
+          num_classes: 102  # Flowers102 (Task 2)
       vib_channels: 256
     frozen_modules: ['client.stem'] # Freeze shared stem from Stage 1
     forward_hook:
       input: []
       output: ['task_predictions', 'downstream_outputs', 'z_film_likelihoods']
 
-datasets: # MODIFIED
+datasets: # Unchanged from stage2_cifar_flowers.yaml, as get_mantis_*_dataset handles num_tasks
   train: !import_call
     _init:
       module_path: 'src.registry'
@@ -61,7 +67,7 @@ datasets: # MODIFIED
       use_multidataset: True
 
 train:
-  num_epochs: 50 # RESTORED
+  num_epochs: 50
   batch_size: 32
   log_freq: 100
 
@@ -91,7 +97,7 @@ train:
   scheduler:
     key: 'CosineAnnealingLR'
     kwargs:
-      T_max: 50 # RESTORED (should match num_epochs)
+      T_max: 50
       eta_min: 0.000001
 
   criterion:
@@ -119,8 +125,11 @@ train:
           criterion:
             key: 'multi_task_downstream_loss'
             kwargs:
-              num_tasks: 2
-              task_loss_configs:
+              num_tasks: 3 # MODIFIED
+              task_loss_configs: # MODIFIED
+                - type: 'CrossEntropyLoss'
+                  params:
+                    reduction: 'mean'
                 - type: 'CrossEntropyLoss'
                   params:
                     reduction: 'mean'
@@ -153,7 +162,7 @@ test:
 
 save:
   checkpoint_interval: 5
-  checkpoint_path: './saved_checkpoints/stage2_cifar_flowers/'
+  checkpoint_path: './saved_checkpoints/stage2_cifar_food_flowers/' # MODIFIED
 
 # Evaluation metrics for multi-task setting
 eval:

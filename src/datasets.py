@@ -1,6 +1,6 @@
 import torch
 import torch.utils.data as data
-from torchvision.datasets import ImageFolder, CIFAR100, Flowers102
+from torchvision.datasets import ImageFolder, CIFAR100, Flowers102, Food101
 from torchvision import transforms
 import os
 import json
@@ -231,9 +231,47 @@ def create_mantis_datasets(data_root, image_size=224, use_multidataset=False):
         Dictionary containing train and validation datasets
     """
     if use_multidataset:
-        # Implementation for combining multiple datasets
-        # This would require additional dataset implementations
-        raise NotImplementedError("Multi-dataset support not yet implemented")
+        data_root_cifar = os.path.join(data_root, 'cifar100')
+        data_root_food101 = os.path.join(data_root, 'food-101') # torchvision default is 'food-101'
+        data_root_flowers = os.path.join(data_root, 'flowers102')
+
+        # Ensure directories exist
+        os.makedirs(data_root_cifar, exist_ok=True)
+        os.makedirs(data_root_food101, exist_ok=True)
+        os.makedirs(data_root_flowers, exist_ok=True)
+
+        # Get CIFAR100 datasets
+        cifar100_train = get_cifar100_dataset(data_root_cifar, is_training=True, image_size=image_size, download=True)
+        cifar100_val = get_cifar100_dataset(data_root_cifar, is_training=False, image_size=image_size, download=True)
+
+        # Get Food101 datasets
+        food101_train = get_food101_dataset(data_root_food101, is_training=True, image_size=image_size, download=True)
+        food101_val = get_food101_dataset(data_root_food101, is_training=False, image_size=image_size, download=True)
+
+        # Get Flowers102 datasets
+        flowers102_train = get_flowers102_dataset(data_root_flowers, is_training=True, image_size=image_size, download=True)
+        flowers102_val = get_flowers102_dataset(data_root_flowers, is_training=False, image_size=image_size, download=True)
+
+        train_datasets = [cifar100_train, food101_train, flowers102_train]
+        val_datasets = [cifar100_val, food101_val, flowers102_val]
+
+        # Task mappings: CIFAR100 is task 0, Food101 is task 1, Flowers102 is task 2
+        task_mappings_cifar = {i: [0] for i in range(100)}  # 100 classes in CIFAR100
+        task_mappings_food101 = {i: [1] for i in range(101)} # 101 classes in Food101
+        task_mappings_flowers = {i: [2] for i in range(102)} # 102 classes in Flowers102
+
+        train_task_mappings = [task_mappings_cifar, task_mappings_food101, task_mappings_flowers]
+        val_task_mappings = [task_mappings_cifar, task_mappings_food101, task_mappings_flowers]
+
+        train_md_wrapper = MultiDatasetWrapper(datasets=train_datasets, task_mappings=train_task_mappings)
+        val_md_wrapper = MultiDatasetWrapper(datasets=val_datasets, task_mappings=val_task_mappings)
+
+        return {
+            'train': train_md_wrapper,
+            'val': val_md_wrapper,
+            'num_tasks': 3,
+            'task_names': ['cifar100', 'food101', 'flowers102']
+        }
     else:
         # Single ImageNet with task subgroups
         task_definitions = create_imagenet_task_definitions()
@@ -295,6 +333,50 @@ def get_cifar100_dataset(data_root, is_training=True, image_size=224, download=T
     dataset = CIFAR100(
         root=data_root,
         train=is_training,
+        transform=transform,
+        download=download
+    )
+    return dataset
+
+
+def get_food101_dataset(data_root, is_training=True, image_size=224, download=True):
+    """
+    Get Food101 dataset.
+
+    Args:
+        data_root: Root directory for Food101 data
+        is_training: Whether for training (applies augmentation)
+        image_size: Target image size
+        download: Whether to download the dataset if not present
+
+    Returns:
+        Food101 dataset object
+    """
+    # Using ImageNet default mean/std as they are commonly used for Food101
+    normalize_mean = [0.485, 0.456, 0.406]
+    normalize_std = [0.229, 0.224, 0.225]
+
+    if is_training:
+        transform = transforms.Compose([
+            transforms.RandomResizedCrop(image_size, scale=(0.7, 1.0)), # Adjusted scale for potentially larger variations
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=normalize_mean, std=normalize_std)
+        ])
+    else:
+        transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=normalize_mean, std=normalize_std)
+        ])
+
+    split_name = 'train' if is_training else 'test' # Food101 uses 'test' for validation
+
+    dataset = Food101(
+        root=data_root,
+        split=split_name,
         transform=transform,
         download=download
     )
