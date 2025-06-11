@@ -1,16 +1,18 @@
-# configs/stage2_webdataset_training.yaml
+# configs/stage2_multi_dataset_training.yaml
 project:
-  save_dir: './saved_checkpoints/stage2_from_config/'
+  save_dir: './saved_checkpoints/stage2_multi_dataset/'
   use_wandb: true
-  wandb_project: 'mantis-stage2'
+  wandb_project: 'mantis-stage2-multi-dataset'
   wandb_run_name: null # auto-generated if null
-  wandb_tags: ['webdataset', 'from-config']
+  wandb_tags: ['multi-dataset', 'cifar100', 'stl10', 'flowers102']
 
 data:
-  data_dir: '~/imagenet-1k-wds'
-  num_workers: 1
+  data_root: './data/multi_task'  # Root for all datasets
+  use_multi_dataset: true
+  download_datasets: true
+  num_workers: 2
   prefetch_factor: 2
-  image_size: 224 # not used in script, but good to have
+  image_size: 224
 
 model:
   type: 'mantis_stage2'
@@ -24,7 +26,7 @@ model:
     encoder_output_channels: 48 # Final output of FiLMedEncoder, should match vib_channels
 
     # --- Stage 2 Specific Architecture Params ---
-    num_tasks: 5 # 'Animals', 'Vehicles', 'Food', 'Plants', 'Objects'
+    num_tasks: 3 # CIFAR-100, STL-10, Flowers-102
     
     # Client-side (post-stem) parameters
     task_detector_hidden_dim: 64
@@ -39,26 +41,26 @@ model:
 
 training:
   device: 'cuda'
-  num_epochs: 100
-  batch_size: 3
-  grad_accumulation_steps: 5  # Increased from 3 to maintain effective batch size ~240
+  num_epochs: 50  # Reduced for faster convergence with smaller datasets
+  batch_size: 16  # Increased from 3 since datasets are smaller
+  grad_accumulation_steps: 2  # Reduced to maintain reasonable effective batch size
   use_amp: true
   optimizer:
-    main_lr: 0.0001  # Increased from 1e-5 to 1e-4
-    backbone_lr: 0.00001  # Increased from 1e-6 to 1e-5
+    main_lr: 0.0001
+    backbone_lr: 0.00001
     weight_decay: 0.01
     gradient_clip_val: 1.0
   scheduler:
     type: 'CosineAnnealingLR'
     params:
-      eta_min: 0.000001 # Corresponds to main_lr / 100
+      eta_min: 0.000001
   loss_weights:
     lambda_task: 1.0
     lambda_downstream: 1.0
-    beta_prime: 0.01  # Increased from 0.01 to 0.1 for stronger VIB regularization
+    beta_prime: 0.01
 
 logging_and_saving:
-  log_freq: 100
-  save_freq: 1
+  log_freq: 50  # More frequent logging for smaller dataset
+  save_freq: 2  # Save every 2 epochs
   monitor_memory: true
   profile_batches: 0 

@@ -1,8 +1,6 @@
-# file_path: scripts/train_stage2_webdataset.py
 #!/usr/bin/env python3
 """
-MANTiS Stage 2 Training with WebDataset ImageNet and Multi-Task Labels.
-# ... (license and other comments)
+MANTiS Stage 2 Training with Multi-Dataset (CIFAR-100, STL-10, Flowers-102).
 """
 
 import sys
@@ -18,8 +16,6 @@ import wandb
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
-from torch.utils.data.dataloader import default_collate
-import webdataset as wds
 import yaml
 from types import SimpleNamespace
 import json
@@ -28,108 +24,14 @@ src_path = Path(__file__).parent.parent / 'src'
 sys.path.insert(0, str(src_path))
 
 import registry
-from webdataset_wrapper import ImageNetWebDataset
+from multi_dataset_wrapper import (
+    create_multi_task_datasets, 
+    create_task_definitions_multi_dataset,
+    multi_dataset_collate_fn
+)
 from models import MantisStage2
 from losses import CombinedMantisLoss
-from datasets import create_imagenet_task_definitions
 
-def create_task_processor_fn(task_definitions_dict):
-    """Creates a function to process raw class labels into MANTiS multi-task targets."""
-    task_names_list = list(task_definitions_dict.keys())
-    num_tasks = len(task_names_list)
-    
-    class_to_tasks_map = {}
-    for task_idx, (task_name, class_indices) in enumerate(task_definitions_dict.items()):
-        for class_idx in class_indices:
-            if class_idx not in class_to_tasks_map:
-                class_to_tasks_map[class_idx] = []
-            class_to_tasks_map[class_idx].append(task_idx)
-            
-    task_class_mappings_map = {} 
-    for task_idx, (task_name, class_indices) in enumerate(task_definitions_dict.items()):
-        task_class_mappings_map[task_idx] = {
-            orig_idx: new_idx for new_idx, orig_idx in enumerate(class_indices)
-        }
-
-    def process_target(original_class_str):
-        original_class = int(original_class_str)
-        y_task = torch.zeros(num_tasks, dtype=torch.float32)
-        y_downstream = [None] * num_tasks 
-
-        if original_class in class_to_tasks_map:
-            active_tasks_for_class = class_to_tasks_map[original_class]
-            for task_idx in active_tasks_for_class:
-                y_task[task_idx] = 1.0
-                if task_idx in task_class_mappings_map:
-                    task_specific_class = task_class_mappings_map[task_idx].get(original_class)
-                    if task_specific_class is not None:
-                         y_downstream[task_idx] = task_specific_class 
-        
-        return {
-            'Y_task': y_task,
-            'Y_downstream': y_downstream, 
-            'original_class': original_class
-        }
-    return process_target
-
-def mantis_collate_fn(batch):
-    """
-    Custom collate_fn for MANTiS Stage 2.
-    Handles `Y_downstream` which is a list of lists containing ints or Nones.
-    """
-    # Separate images and targets
-    images = [item[0] for item in batch]
-    targets_list = [item[1] for item in batch]
-
-    # Collate images using default_collate
-    collated_images = default_collate(images)
-
-    # Collate target components
-    collated_targets = {}
-    if targets_list:
-        # Y_task is already a tensor per sample, stack them
-        collated_targets['Y_task'] = default_collate([t['Y_task'] for t in targets_list])
-        
-        # original_class is an int per sample, stack them
-        collated_targets['original_class'] = default_collate([t['original_class'] for t in targets_list])
-
-        # Handle Y_downstream carefully
-        num_tasks = len(targets_list[0]['Y_downstream'])
-        y_downstream_collated_per_task = [[] for _ in range(num_tasks)]
-        
-        for sample_targets in targets_list:
-            for task_idx in range(num_tasks):
-                label = sample_targets['Y_downstream'][task_idx]
-                y_downstream_collated_per_task[task_idx].append(label if label is not None else -100)
-        
-        collated_targets['Y_downstream'] = [
-            torch.tensor(task_labels, dtype=torch.long) for task_labels in y_downstream_collated_per_task
-        ]
-    
-    return collated_images, collated_targets
-
-def calculate_filmed_encoder_channels(output_channels, num_blocks, architecture='convgdn'):
-    """Calculate the actual output channels for each FiLMed encoder block."""
-    if architecture == 'convgdn':
-        # FrankenSplit AnalysisNetworkCNN pattern
-        block_channels = [
-            output_channels * 4,  # First block: input_channels -> output_channels * 4
-            output_channels * 2,  # Second block: output_channels * 4 -> output_channels * 2
-            output_channels,      # Third block: output_channels * 2 -> output_channels
-        ]
-        
-        # Adjust if num_blocks is different
-        if num_blocks < 3:
-            block_channels = block_channels[:num_blocks]
-        elif num_blocks > 3:
-            # Add processing blocks (all output_channels)
-            for _ in range(num_blocks - 3):
-                block_channels.append(output_channels)
-                
-        return block_channels
-    else:
-        # Original residual architecture - all blocks have same output channels
-        return [output_channels] * num_blocks
 
 def setup_models_and_load_checkpoint(config, device, task_definitions, rank=0):
     if rank == 0:
@@ -162,7 +64,7 @@ def setup_models_and_load_checkpoint(config, device, task_definitions, rank=0):
     # Task-specific decoder parameters (same for all tasks)
     decoder_params_list = [
         {
-            'input_channels': model_cfg.vib_channels,
+            'input_channels': model_cfg.vib_channels, 
             'output_channels': model_cfg.decoder_output_channels
         }
         for _ in range(num_tasks)
@@ -192,7 +94,10 @@ def setup_models_and_load_checkpoint(config, device, task_definitions, rank=0):
     
     model.load_stage1_decoder_weights(config.model.stage1_checkpoint_path, rank)
     
-    model.load_teacher_tail_weights(task_definitions, rank)
+    # Note: For multi-dataset, we don't load teacher tail weights since each dataset
+    # has its own label space. The tails will be randomly initialized.
+    if rank == 0:
+        print("Note: Tail weights are randomly initialized for multi-dataset training.")
 
     if config.model.freeze_stem:
         if rank == 0:
@@ -205,11 +110,13 @@ def setup_models_and_load_checkpoint(config, device, task_definitions, rank=0):
         print(f"✓ MantisStage2 model setup complete. Parameters: {sum(p.numel() for p in model.parameters()):,}")
     return model
 
+
 def setup_optimizer(model, config):
     main_lr = config.training.optimizer.main_lr
     backbone_lr = config.training.optimizer.backbone_lr
     weight_decay = config.training.optimizer.weight_decay
     freeze_stem = config.model.freeze_stem
+    
     param_groups = [
         {'params': [], 'lr': main_lr, 'name': 'client_stem'},
         {'params': [], 'lr': main_lr, 'name': 'client_encoder_convs'},
@@ -249,6 +156,7 @@ def setup_optimizer(model, config):
     optimizer = torch.optim.AdamW(final_param_groups, weight_decay=weight_decay)
     return optimizer
 
+
 def setup_training_components(student_model, config, num_tasks, task_loss_configs):
     print("Setting up training components (optimizer, scheduler, loss)...")
     
@@ -262,13 +170,11 @@ def setup_training_components(student_model, config, num_tasks, task_loss_config
         scheduler_config = config.training.scheduler
         scheduler_type = scheduler_config.type
         
-        # Convert SimpleNamespace to dict for **kwargs unpacking
         try:
             scheduler_params = vars(scheduler_config.params)
         except TypeError:
-            scheduler_params = {} # Handle case where params might not be defined
+            scheduler_params = {}
 
-        # Special handling for T_max if not specified, default to num_epochs
         if scheduler_type == 'CosineAnnealingLR' and 'T_max' not in scheduler_params:
             scheduler_params['T_max'] = config.training.num_epochs
             print(f"Scheduler T_max not specified, defaulting to num_epochs: {config.training.num_epochs}")
@@ -279,14 +185,11 @@ def setup_training_components(student_model, config, num_tasks, task_loss_config
             print(f"✓ Scheduler '{scheduler_type}' initialized with params: {scheduler_params}")
         except AttributeError:
             print(f"Error: Scheduler type '{scheduler_type}' not found in torch.optim.lr_scheduler.")
-            # Fallback or raise error
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.training.num_epochs)
             print("Defaulting to CosineAnnealingLR with T_max=num_epochs.")
     else:
-        # Fallback for older configs without a scheduler section
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.training.num_epochs, eta_min=config.training.optimizer.main_lr / 100)
         print("✓ Scheduler section not found in config, using default CosineAnnealingLR.")
-
 
     loss_weights = config.training.loss_weights
     combined_loss_fn = CombinedMantisLoss(
@@ -298,6 +201,7 @@ def setup_training_components(student_model, config, num_tasks, task_loss_config
     )
     print("✓ Training components setup complete.")
     return optimizer, scheduler, combined_loss_fn
+
 
 def train_epoch(student_model, train_loader, optimizer, combined_loss_fn, epoch_idx, device, log_freq,
                 grad_accumulation_steps, use_amp, scaler, monitor_memory, is_ddp, rank, num_epochs_total, profile_batches, gradient_clip_val):
@@ -323,7 +227,6 @@ def train_epoch(student_model, train_loader, optimizer, combined_loss_fn, epoch_
             'Y_downstream': [t.to(device, non_blocking=True) for t in targets_dict['Y_downstream']]
         }
 
-        # Corrected autocast: remove device_type, ensure enabled only when use_amp and on cuda
         with autocast(device_type=device.split(':')[0], dtype=torch.float16, enabled=(use_amp and 'cuda' in device)): 
             student_outputs = student_model(images) 
             loss_components = combined_loss_fn(student_outputs, targets_for_loss_fn)
@@ -403,6 +306,7 @@ def train_epoch(student_model, train_loader, optimizer, combined_loss_fn, epoch_
             
     return avg_losses
 
+
 def validate_epoch(student_model, val_loader, combined_loss_fn, epoch_idx, device, use_amp, is_ddp, rank, num_epochs_total):
     student_model.eval()
     
@@ -421,7 +325,7 @@ def validate_epoch(student_model, val_loader, combined_loss_fn, epoch_idx, devic
                 'Y_task': targets_dict['Y_task'].to(device, non_blocking=True),
                 'Y_downstream': [t.to(device, non_blocking=True) for t in targets_dict['Y_downstream']]
             }
-            # Corrected autocast: remove device_type, ensure enabled only when use_amp and on cuda
+            
             with autocast(device_type=device.split(':')[0], dtype=torch.float16, enabled=(use_amp and 'cuda' in device)): 
                 student_outputs = student_model(images)
                 loss_components = combined_loss_fn(student_outputs, targets_for_loss_fn_val)
@@ -452,6 +356,7 @@ def validate_epoch(student_model, val_loader, combined_loss_fn, epoch_idx, devic
             
     return avg_losses_val
 
+
 def get_gpu_memory_info(): 
     if not torch.cuda.is_available(): return {}
     current_device = torch.cuda.current_device()
@@ -467,19 +372,18 @@ def get_gpu_memory_info():
         f'gpu{current_device}_total_memory_gb': total_memory,
     }
 
+
 def main():
     global prof 
     prof = None
-    parser = argparse.ArgumentParser(description='MANTiS Stage 2 Training from config file')
+    parser = argparse.ArgumentParser(description='MANTiS Stage 2 Multi-Dataset Training')
     parser.add_argument('--config', type=str, required=True, help='Path to the YAML configuration file.')
     cli_args = parser.parse_args()
 
     with open(cli_args.config, 'r') as f:
         config_dict = yaml.safe_load(f)
 
-    # Convert dict to a nested namespace object for easier access
     config = json.loads(json.dumps(config_dict), object_hook=lambda d: SimpleNamespace(**d))
-
 
     # DDP Setup
     if "LOCAL_RANK" in os.environ:
@@ -502,16 +406,16 @@ def main():
     scaler = GradScaler(enabled=scaler_enabled)
 
     torch.backends.cudnn.benchmark = True
-    config.data.data_dir = os.path.expanduser(config.data.data_dir)
+    config.data.data_root = os.path.expanduser(config.data.data_root)
     config.project.save_dir = os.path.expanduser(config.project.save_dir)
     if use_amp and device == 'cpu': 
         use_amp = False 
         if rank == 0: print("AMP disabled for CPU.")
     
     if config.project.use_wandb and rank == 0:
-        wandb_config = config_dict # Log the original dict
+        wandb_config = config_dict
         if torch.cuda.is_available(): wandb_config.update(get_gpu_memory_info())
-        wandb_run_name = config.project.wandb_run_name if config.project.wandb_run_name else f"stage2_config_{time.strftime('%Y%m%d_%H%M%S')}"
+        wandb_run_name = config.project.wandb_run_name if config.project.wandb_run_name else f"stage2_multi_dataset_{time.strftime('%Y%m%d_%H%M%S')}"
         wandb.init(project=config.project.wandb_project, name=wandb_run_name, tags=config.project.wandb_tags, config=wandb_config)
         if not hasattr(train_epoch, 'use_wandb'): 
              train_epoch.use_wandb = True
@@ -521,7 +425,7 @@ def main():
             train_epoch.use_wandb = False
 
     if rank == 0:
-        print(f"MANTiS Stage 2 Training - PID: {os.getpid()}")
+        print(f"MANTiS Stage 2 Multi-Dataset Training - PID: {os.getpid()}")
         print(f"Loaded configuration from: {cli_args.config}")
         print(f"Torch version: {torch.__version__}")
         if torch.cuda.is_available():
@@ -529,7 +433,7 @@ def main():
             print(f"CuDNN version: {torch.backends.cudnn.version() if hasattr(torch.backends.cudnn, 'version') else 'N/A'}") 
             print(f"GPU: {torch.cuda.get_device_name(torch.cuda.current_device()) if torch.cuda.is_available() else 'N/A'}")
         print(f"Using device: {device}")
-        print(f"Data directory: {config.data.data_dir}")
+        print(f"Data root: {config.data.data_root}")
         print(f"Batch size (per GPU): {config.training.batch_size}, Grad Acc Steps: {config.training.grad_accumulation_steps}")
         print(f"Effective global batch size: {config.training.batch_size * world_size * config.training.grad_accumulation_steps}")
         print(f"Num workers: {config.data.num_workers}, Prefetch factor: {config.data.prefetch_factor}")
@@ -539,46 +443,47 @@ def main():
 
     os.makedirs(config.project.save_dir, exist_ok=True)
 
-    task_definitions = create_imagenet_task_definitions()
+    # Load multi-dataset
+    task_definitions = create_task_definitions_multi_dataset()
     num_tasks = len(task_definitions)
     task_names = list(task_definitions.keys())
-    task_classes_counts = [len(v) for v in task_definitions.values()] 
     if rank == 0: print(f"Defined {num_tasks} tasks: {task_names}")
 
-    target_processor_func = create_task_processor_fn(task_definitions)
-
-    if rank == 0: print("\nLoading data...")
+    if rank == 0: print("\nLoading multi-dataset...")
     
-    _train_wds_dataset_obj = ImageNetWebDataset(
-        data_dir=config.data.data_dir, split='train', batch_size=config.training.batch_size, 
-        num_workers=config.data.num_workers, prefetch_factor=config.data.prefetch_factor, 
-        image_size=config.data.image_size, target_processor=target_processor_func, resampled=True
+    datasets_info = create_multi_task_datasets(
+        data_root=config.data.data_root,
+        image_size=config.data.image_size,
+        download=config.data.download_datasets
     )
-    _train_wds_dataset = _train_wds_dataset_obj.create_dataset()
-
-
-    _val_wds_dataset_obj = ImageNetWebDataset(
-        data_dir=config.data.data_dir, split='val', batch_size=config.training.batch_size, 
-        num_workers=config.data.num_workers, prefetch_factor=config.data.prefetch_factor, 
-        image_size=config.data.image_size, target_processor=target_processor_func, resampled=False
-    )
-    _val_wds_dataset = _val_wds_dataset_obj.create_dataset()
     
     train_loader = DataLoader(
-        _train_wds_dataset, batch_size=config.training.batch_size, num_workers=config.data.num_workers,
-        persistent_workers=True if config.data.num_workers > 0 else False, pin_memory=False,
+        datasets_info['train'], 
+        batch_size=config.training.batch_size, 
+        num_workers=config.data.num_workers,
+        persistent_workers=True if config.data.num_workers > 0 else False, 
+        pin_memory=True,
         prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else None,
-        drop_last=(True), collate_fn=mantis_collate_fn 
+        drop_last=True, 
+        shuffle=True,
+        collate_fn=multi_dataset_collate_fn 
     )
+    
     val_loader = DataLoader(
-        _val_wds_dataset, batch_size=config.training.batch_size, num_workers=config.data.num_workers,
-        persistent_workers=True if config.data.num_workers > 0 else False, pin_memory=False,
+        datasets_info['val'], 
+        batch_size=config.training.batch_size, 
+        num_workers=config.data.num_workers,
+        persistent_workers=True if config.data.num_workers > 0 else False, 
+        pin_memory=True,
         prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else None,
-        drop_last=(False), collate_fn=mantis_collate_fn 
+        drop_last=False, 
+        shuffle=False,
+        collate_fn=multi_dataset_collate_fn 
     )
 
-    if rank == 0: print(f"Train/Val loaders created with custom collate_fn. Approx batches per GPU: {len(train_loader) if hasattr(train_loader, '__len__') else 'Unknown'}/{len(val_loader) if hasattr(val_loader, '__len__') else 'Unknown'}")
-
+    if rank == 0: 
+        print(f"Train/Val loaders created. Batches per GPU: {len(train_loader)}/{len(val_loader)}")
+        print(f"Classes per task: {datasets_info['num_classes']}")
 
     student_model = setup_models_and_load_checkpoint(config, device, task_definitions, rank)
     
@@ -601,7 +506,6 @@ def main():
         if rank == 0: print(f"Resumed from epoch {start_epoch}, best val loss: {best_val_loss:.4f}")
         if is_ddp: dist.barrier()
 
-
     if is_ddp:
         student_model = DDP(student_model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
@@ -619,8 +523,7 @@ def main():
             scaler.load_state_dict(checkpoint['scaler_state_dict'])
         if rank == 0: print("Optimizer, scheduler, and scaler states loaded for Stage 2 resumption.")
 
-
-    if rank == 0: print(f"\nStarting Stage 2 training for {config.training.num_epochs} epochs...")
+    if rank == 0: print(f"\nStarting Stage 2 multi-dataset training for {config.training.num_epochs} epochs...")
     
     log_saving_cfg = config.logging_and_saving
     if log_saving_cfg.profile_batches > 0 and device.startswith('cuda') and rank == 0: 
@@ -634,12 +537,8 @@ def main():
         if prof: prof.start() 
         print(f"Profiler started. Traces will be saved to {profiler_log_dir}")
 
-
     for epoch in range(start_epoch, config.training.num_epochs):
         epoch_start_time = time.time()
-        
-        if hasattr(train_loader.dataset, 'set_epoch'): 
-             train_loader.dataset.set_epoch(epoch)
 
         gradient_clip_val = config.training.optimizer.gradient_clip_val if hasattr(config.training.optimizer, 'gradient_clip_val') else 0.0
 
@@ -687,12 +586,10 @@ def main():
                     'scaler_state_dict': scaler.state_dict() if scaler.is_enabled() else None,
                 }
 
-                # Save the latest checkpoint to allow for easy resumption
                 latest_save_path = os.path.join(config.project.save_dir, 'latest_checkpoint.pth')
                 torch.save(checkpoint, latest_save_path)
                 print(f"  Saved latest checkpoint to {latest_save_path}")
 
-                # Save epoch-specific checkpoint if desired
                 if (epoch + 1) % log_saving_cfg.save_freq == 0:
                     save_path = os.path.join(config.project.save_dir, f'checkpoint_epoch_{epoch+1}.pth')
                     torch.save(checkpoint, save_path)
@@ -707,13 +604,12 @@ def main():
             print("Exiting after profiling first epoch as per configuration.")
             break 
 
-
     if prof and hasattr(prof, 'profiler') and prof.profiler is not None and rank == 0: 
         prof.stop()
         print(f"Profiling finished. Traces saved to {os.path.join(config.project.save_dir, 'profiler_traces_stage2')}")
 
     if rank == 0:
-        print(f"\n🎉 Stage 2 Training completed!")
+        print(f"\n🎉 Stage 2 Multi-Dataset Training completed!")
         print(f"Best validation loss: {best_val_loss:.4f}")
         print(f"Checkpoints saved to: {config.project.save_dir}")
         if hasattr(train_epoch, 'use_wandb') and train_epoch.use_wandb:
@@ -724,5 +620,6 @@ def main():
     if is_ddp:
         dist.destroy_process_group()
 
+
 if __name__ == '__main__':
-    main()
+    main() 

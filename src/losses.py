@@ -57,11 +57,10 @@ class VIBLossStage1(nn.Module):
         if z_likelihoods.ndim >= 2:
             batch_size = z_likelihoods.shape[0]
             # Rate per pixel: sum(-log2 P(z)) / (B * H * W)
-            # Add epsilon for numerical stability with log2
-            rate = torch.sum(-torch.log2(z_likelihoods + 1e-10)) / (batch_size * self.num_pixels_placeholder)
+            rate = torch.sum(-torch.log2(z_likelihoods)) / (batch_size * self.num_pixels_placeholder)
         else:
             # Fallback for unexpected shapes
-            rate = torch.sum(-torch.log2(z_likelihoods + 1e-10))
+            rate = torch.sum(-torch.log2(z_likelihoods))
             
         return rate
 

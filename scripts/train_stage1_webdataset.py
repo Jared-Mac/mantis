@@ -1,12 +1,12 @@
-# file_path: scripts/train_stage1_webdataset.py
 #!/usr/bin/env python3
 """
 MANTiS Stage 1 Training with WebDataset ImageNet.
 
 This script trains Stage 1 of MANTiS using:
-1. WebDataset ImageNet format
-2. ResNet50 teacher for head distillation
-3. VIB rate loss for compression
+1. A configuration file for all parameters.
+2. WebDataset for efficient data loading.
+3. A truncated ResNet50 teacher for head distillation.
+4. VIB rate loss for compression.
 """
 
 import sys
@@ -15,686 +15,559 @@ import argparse
 from pathlib import Path
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast # For Mixed Precision
+from torch.cuda.amp import GradScaler        # autocast -> torch.amp.autocast
+from torch import amp
 from tqdm import tqdm
 import time
 import wandb
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
-torch.autograd.set_detect_anomaly(True)
+import yaml
+import json
+from types import SimpleNamespace
+import torchvision.models as models
+import torch.nn.functional as F                           
+
 # Add src directory to Python path
 src_path = Path(__file__).parent.parent / 'src'
 sys.path.insert(0, str(src_path))
 
 # Import our modules
-import registry  # This registers our components
+import registry
 from webdataset_wrapper import create_imagenet_webdataset_loaders
-from models import MantisStage1
+from client.models import MANTiSClient
+from server.decoders_tails import FrankenSplitDecoder
 from losses import VIBLossStage1
-import torchvision.models as models
+from vib import VIBBottleneck
 
-# For profiling
-# import torch.profiler
+class Stage1MANTiSWrapper(nn.Module):
+    def __init__(self, client_params, decoder_params, vib_channels):
+        super().__init__()
+        self.latent_channels = vib_channels          # <-- remember it
 
+        # client / bottleneck / decoder
+        self.client   = MANTiSClient(
+            num_tasks=client_params.get('num_tasks', 3),
+            latent_channels=vib_channels,
+        )
+        self.vib      = VIBBottleneck(vib_channels)
+        self.decoder  = FrankenSplitDecoder(
+            input_channels=vib_channels,
+            output_channels=decoder_params['output_channels'],
+        )
 
-def get_argparser():
-    parser = argparse.ArgumentParser(description='MANTiS Stage 1 Training with WebDataset')
-    parser.add_argument('--data_dir', type=str, default='~/imagenet-1k-wds',
-                        help='Directory containing ImageNet webdataset .tar files. Consider staging to local SSD if on a cluster.')
-    parser.add_argument('--batch_size', type=int, default=64,
-                        help='Batch size for training')
-    parser.add_argument('--num_epochs', type=int, default=50,
-                        help='Number of training epochs')
-    parser.add_argument('--lr', type=float, default=0.0001,
-                        help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.01,
-                        help='Weight decay')
-    parser.add_argument('--beta_stage1', type=float, default=0.01,
-                        help='Weight for VIB rate loss')
-    parser.add_argument('--num_workers', type=int, default=16, # Adjusted default, tune based on system
-                        help='Number of data loading workers. Tune based on CPU cores and I/O.')
-    parser.add_argument('--prefetch_factor', type=int, default=8, # PyTorch default, can be tuned
-                        help='Number of batches loaded in advance by each worker.')
-    parser.add_argument('--device', type=str, default='cuda',
-                        help='Device to use for training')
-    parser.add_argument('--save_dir', type=str, default='./saved_checkpoints/stage1/',
-                        help='Directory to save checkpoints')
-    parser.add_argument('--log_freq', type=int, default=200, # Increased logging frequency
-                        help='Logging frequency (batches)')
-    parser.add_argument('--save_freq', type=int, default=1,
-                        help='Checkpoint save frequency (epochs)')
+        # identity FiLM (γ = 1, β = 0) kept as a buffer
+        self.register_buffer(
+            "identity_film_params",
+            torch.cat(
+                [torch.ones(vib_channels), torch.zeros(vib_channels)]
+            ),
+        )
 
-    # Wandb arguments
-    parser.add_argument('--use_wandb', action='store_true',
-                        help='Enable wandb logging')
-    parser.add_argument('--wandb_project', type=str, default='mantis-stage1',
-                        help='Wandb project name')
-    parser.add_argument('--wandb_run_name', type=str, default=None,
-                        help='Wandb run name')
-    parser.add_argument('--wandb_tags', type=str, nargs='*', default=[],
-                        help='Wandb tags')
+    def forward(self, x):
+        b = x.size(0)
 
-    # Memory management arguments
-    parser.add_argument('--grad_accumulation_steps', type=int, default=1,
-                        help='Number of gradient accumulation steps to reduce memory usage')
-    parser.add_argument('--use_checkpointing', action='store_true', # torch.utils.checkpoint
-                        help='Use gradient checkpointing to save memory')
-    parser.add_argument('--monitor_memory', action='store_true',
-                        help='Monitor and log GPU memory usage')
-    parser.add_argument('--use_amp', action='store_true',
-                        help='Use Automatic Mixed Precision (AMP)')
-    parser.add_argument('--profile_batches', type=int, default=0,
-                        help='Number of initial batches to profile with torch.profiler. 0 to disable.')
+        # stem → encoder (identity FiLM)
+        f_stem = self.client.stem(x)
+        identity_film = self.identity_film_params.unsqueeze(0).expand(b, -1)
+        z_raw = self.client.filmed_encoder(f_stem, identity_film)
 
-    # Checkpoint resuming
-    parser.add_argument('--resume_checkpoint', type=str, default=None,
-                        help='Path to checkpoint file to resume training from')
+        # VIB bottleneck
+        z_hat, z_liks = self.vib(z_raw, training=self.training)
 
-    return parser
+        # decoder for head‑distillation
+        g_s = self.decoder(z_hat)
 
+        return {
+            "g_s_output": g_s,
+            "z_likelihoods": {"z": z_liks},
+            "debug_z_raw_mean":  z_raw.mean(),
+            "debug_z_hat_mean":  z_hat.mean(),
+            "debug_reconstructed_features_mean": g_s.mean(),
+        }
 
-def setup_models(device, use_checkpointing=False): # Added use_checkpointing
-    """Setup teacher and student models."""
+class BppLossStage1(nn.Module):
+    """
+    BppLoss for Stage 1 following the BppLossOrig pattern.
+    Computes rate loss as -log2(likelihoods) normalized by latent spatial dimensions.
+    """
+    
+    def __init__(self, latent_height=28, latent_width=28, reduction='mean'):
+        super().__init__()
+        self.latent_h = latent_height
+        self.latent_w = latent_width
+        self.reduction = reduction
+
+    def forward(self, z_likelihoods_dict, *args, **kwargs):
+        """
+        Compute BPP loss from likelihoods.
+        
+        Args:
+            z_likelihoods_dict: Dictionary containing 'z' key with likelihoods tensor
+            
+        Returns:
+            BPP loss (bits per latent pixel)
+        """
+        if isinstance(z_likelihoods_dict, dict) and 'z' in z_likelihoods_dict:
+            likelihoods = z_likelihoods_dict['z']
+        else:
+            likelihoods = z_likelihoods_dict
+            
+        n = likelihoods.size(0)  # batch size
+        
+        if self.reduction == 'sum':
+            bpp = -likelihoods.log2().sum()
+        elif self.reduction == 'batchmean':
+            bpp = -likelihoods.log2().sum() / n
+        elif self.reduction == 'mean':
+            bpp = -likelihoods.log2().sum() / (n * self.latent_h * self.latent_w)
+        else:
+            raise Exception(f"Reduction: {self.reduction} does not exist")
+            
+        return bpp
+
+def setup_models(config, device, rank=0):
+    """Setup teacher and student models based on the config."""
     print("Setting up models...")
+    model_cfg = config.model.config
 
-    # Teacher model (frozen ResNet50) - truncated to layer2 for efficiency
+    # Teacher model (frozen ResNet50) - truncated to layer2 for distillation
     full_teacher = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
 
-    # Create truncated teacher that only goes up to layer2
     class TruncatedResNet50(nn.Module):
         def __init__(self, resnet50):
             super().__init__()
-            self.conv1 = resnet50.conv1
-            self.bn1 = resnet50.bn1
-            self.relu = resnet50.relu
-            self.maxpool = resnet50.maxpool
-            self.layer1 = resnet50.layer1
-            self.layer2 = resnet50.layer2
-            # Note: We exclude layer3, layer4, avgpool, and fc for efficiency
-
+            self.conv1, self.bn1, self.relu, self.maxpool = resnet50.conv1, resnet50.bn1, resnet50.relu, resnet50.maxpool
+            self.layer1, self.layer2 = resnet50.layer1, resnet50.layer2
         def forward(self, x):
-            x = self.conv1(x)
-            x = self.bn1(x)
-            x = self.relu(x)
-            x = self.maxpool(x)
-
+            # Add debug info for teacher model
+            x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
             x = self.layer1(x)
             x = self.layer2(x)
             return x
 
-    teacher_model = TruncatedResNet50(full_teacher)
+    teacher_model = TruncatedResNet50(full_teacher).to(device)
     teacher_model.eval()
     for param in teacher_model.parameters():
         param.requires_grad = False
-    teacher_model = teacher_model.to(device)
 
-    student_model = MantisStage1(
-        client_params={'stem_channels': 128, 'encoder_channels': 256, 'num_encoder_blocks': 3},
-        # Adjusted decoder_params for GenericDecoderStage1:
-        # input_channels is the output of VIBBottleneck (vib_channels = 256)
-        # output_channels is the channel depth of teacher's layer2 (512 for ResNet50)
-        decoder_params={'input_channels': 256, 'output_channels': 512, 'num_processing_blocks': 2}, # Example: 2 processing blocks
-        vib_channels=256
-    )
+    # Test teacher model output range with a dummy input
+    if rank == 0:
+        with torch.no_grad():
+            dummy_input = torch.randn(2, 3, 224, 224).to(device)
+            teacher_test = teacher_model(dummy_input)
+            print(f"\n=== TEACHER MODEL DEBUG ===")
+            print(f"Teacher output shape: {teacher_test.shape}")
+            print(f"Teacher output: min={teacher_test.min().item():.6f}, max={teacher_test.max().item():.6f}, mean={teacher_test.mean().item():.6f}, std={teacher_test.std().item():.6f}")
+            print("=" * 30)
 
-    if use_checkpointing: # Apply gradient checkpointing if enabled
-        print("Applying gradient checkpointing to student model...")
-        if hasattr(student_model.client_encoder.encoder, 'blocks'): # Check if 'blocks' attribute exists
-            # Assuming student_model.client_encoder.encoder.blocks is a ModuleList of checkpointable modules
-            # This is a general example; you might need to adjust based on your model structure
-            # and which specific parts benefit most from checkpointing.
-            # The example below shows a conceptual application.
-            # A more common pattern is to call torch.utils.checkpoint.checkpoint directly in the forward pass
-            # of the module you want to checkpoint.
-            # For this example, let's assume we are wrapping the module if it's not already a DataParallel instance.
-            # This part needs careful implementation based on how MantisStage1 is structured.
-            # The original `checkpoint_wrapper` is less common now.
-            # The current approach is typically:
-            #
-            # from torch.utils.checkpoint import checkpoint
-            #
-            # class MyModule(nn.Module):
-            #     def __init__(self):
-            #         super().__init__()
-            #         self.layer = nn.Linear(10,10)
-            #     def forward(self, x):
-            #          # if self.training and use_checkpointing:
-            #          #    return checkpoint(self.layer, x, use_reentrant=False)
-            #          # else:
-            #          return self.layer(x)
-            #
-            # Given the current structure, we might enable checkpointing within the MantisStage1 model's forward pass
-            # or its submodules' forward passes if `use_checkpointing` is true.
-            # For now, this is a placeholder for where you'd integrate it more deeply.
-            # If MantisStage1 itself or parts of it are single large nn.Sequential,
-            # checkpointing sections of it would be done like:
-            # student_model.client_encoder.encoder = torch.utils.checkpoint.checkpoint_sequential(
-            #    student_model.client_encoder.encoder.blocks,
-            #    segments=len(student_model.client_encoder.encoder.blocks),
-            #    input=dummy_input_for_shape_tracing # this is tricky with dynamic inputs
-            # )
-            # This specific part of checkpointing requires careful thought on model architecture.
-            # The previous `checkpoint_wrapper` is not available in newer torch.
-            # For now, we will assume checkpointing is handled inside the model if args.use_checkpointing is true.
-            pass # Placeholder for more specific checkpointing logic within model definition
+    # Student model - using new config structure
+    student_model = Stage1MANTiSWrapper(
+        client_params=vars(model_cfg.client_params),
+        decoder_params=vars(model_cfg.decoder_params),
+        vib_channels=model_cfg.vib_channels
+    ).to(device)
 
-    student_model = student_model.to(device)
+    print("✓ Models setup complete.")
+    print(f"  Teacher params (frozen): {sum(p.numel() for p in teacher_model.parameters()):,}")
+    print(f"  Student params: {sum(p.numel() for p in student_model.parameters()):,}")
+    return teacher_model, student_model
 
-    # Since we truncated the model, we get layer2 features directly from forward()
-    # No need for hooks anymore, but keeping the structure for compatibility
-    teacher_features = {}
-
-    print(f"✓ Models setup complete")
-    print(f"  Teacher parameters: {sum(p.numel() for p in teacher_model.parameters()):,} (truncated to layer2)")
-    print(f"  Student parameters: {sum(p.numel() for p in student_model.parameters()):,}")
-
-    return teacher_model, student_model, teacher_features
-
-
-def setup_training(student_model, lr, weight_decay):
+def setup_training(student_model, config):
     """Setup optimizer, scheduler, and loss functions."""
     print("Setting up training components...")
+    train_cfg = config.training
+    
+    optimizer = torch.optim.AdamW(student_model.parameters(), lr=train_cfg.optimizer.lr, weight_decay=train_cfg.optimizer.weight_decay)
+    
+    scheduler_cfg = train_cfg.scheduler
+    SchedulerClass = getattr(torch.optim.lr_scheduler, scheduler_cfg.type)
+    scheduler = SchedulerClass(optimizer, **vars(scheduler_cfg.params))
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(student_model.parameters(), lr=lr, weight_decay=weight_decay)
-
-    # Scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=lr/10) # T_max to num_epochs
-
-    # Loss functions
-    # Assuming input 224x224, stem out H/4 (56x56), encoder out H/8 (28x28).
-    # VIB loss is on 'z_likelihoods', which come from z_raw (output of client_encoder).
-    # z_raw is the latent representation before VIBBottleneck.
-    # In MantisStage1, client_encoder (MantisStage1Client) outputs z.
-    # MantisStage1Client: self.stem -> f_stem (B, stem_channels, H/4, W/4)
-    #                     self.encoder(f_stem) -> z (B, encoder_channels, H/8, W/8)
-    # So, if input is 224x224, H/8 = 28. num_pixels_placeholder should be 28*28 = 784.
+    # For BPP-style loss, normalize by latent dimensions
     vib_loss_fn = VIBLossStage1(num_pixels_placeholder=28*28)
     mse_loss_fn = nn.MSELoss()
+    lambda_cos = config.training.loss_weights.lambda_cos  # Read from config
+    
+    # Beta warm-up configuration
+    beta_warmup_epochs = getattr(config.training, 'beta_warmup_epochs', 5)  # Default 5 epochs
+    beta_target = config.training.loss_weights.beta_stage1
+    
+    print(f"✓ Training components setup. Beta warm-up: {beta_warmup_epochs} epochs to reach {beta_target}")
+    print(f"  Cosine loss weight: {lambda_cos}")
+    return optimizer, scheduler, vib_loss_fn, mse_loss_fn, lambda_cos, beta_warmup_epochs, beta_target
 
-    print("✓ Training components setup complete")
-    return optimizer, scheduler, vib_loss_fn, mse_loss_fn
-
-
-def train_epoch(student_model, teacher_model, teacher_features, train_loader,
-                optimizer, vib_loss_fn, mse_loss_fn, beta_stage1, epoch, device, log_freq,
-                grad_accumulation_steps, use_amp, scaler, monitor_memory, is_ddp, rank):
-    """Train for one epoch."""
+def train_epoch(student_model, teacher_model, train_loader, optimizer, vib_loss_fn, mse_loss_fn, lambda_cos, beta_warmup_epochs, beta_target, config, epoch, device, rank, world_size, scaler):
     student_model.train()
-    teacher_model.eval()
-
-    running_loss = 0.0
-    running_hd_loss = 0.0
-    running_vib_loss = 0.0
-
+    
+    # Calculate current beta value with warm-up
+    if epoch < beta_warmup_epochs:
+        current_beta = beta_target * (epoch + 1) / beta_warmup_epochs  # Linear warm-up
+    else:
+        current_beta = beta_target
+    
+    running_loss, running_hd_loss, running_vib_loss = 0.0, 0.0, 0.0
     adaptive_pool = None
-    optimizer.zero_grad()
+    
+    if rank == 0:
+        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{config.training.num_epochs} [Train]', unit="batch")
+    else:
+        pbar = train_loader
 
-    pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{args.num_epochs} [Train]', unit="batch", disable=args.profile_batches > 0 and epoch==0)
+    for batch_idx, (images, _) in enumerate(pbar):
+        optimizer.zero_grad()  # Zero gradients at the start of each batch
+        images = images.to(device, non_blocking=True)
 
-    for batch_idx, (images, labels) in enumerate(pbar):
-        images = images.to(device, non_blocking=True) # non_blocking for pinned memory
+        # Debug input statistics (only first batch to avoid spam)
+        if batch_idx == 0 and rank == 0:
+            print(f"\n=== INPUT DEBUG (Epoch {epoch+1}) ===")
+            print(f"Input images shape: {images.shape}")
+            print(f"Input: min={images.min().item():.6f}, max={images.max().item():.6f}, mean={images.mean().item():.6f}, std={images.std().item():.6f}")
+            print("=" * 30)
 
-        # Teacher forward pass (no gradients)
         with torch.no_grad():
-            teacher_layer2_features = teacher_model(images)
+            teacher_features = teacher_model(images)
 
-        # Student forward pass with AMP context
-        with autocast(enabled=use_amp):
-            student_outputs = student_model(images) # This might need args.use_checkpointing if handled inside
+        with amp.autocast(device_type="cuda", dtype=torch.float16,
+                          enabled=config.training.use_amp):
+            student_outputs = student_model(images)
             student_features = student_outputs['g_s_output']
-            teacher_target = teacher_layer2_features
+            
+            if student_features.shape != teacher_features.shape:
+                if adaptive_pool is None:
+                    adaptive_pool = nn.AdaptiveAvgPool2d(teacher_features.shape[2:]).to(device)
+                student_features = adaptive_pool(student_features)
 
-            if student_features.shape != teacher_target.shape:
-                if adaptive_pool is None: # Initialize adaptive_pool only once if needed
-                    target_spatial_size = teacher_target.shape[-2:]
-                    print(f"Adapting student features from {student_features.shape} to {teacher_target.shape} using target size {target_spatial_size}")
-                    adaptive_pool = nn.AdaptiveAvgPool2d(target_spatial_size).to(device)
-                student_features_adapted = adaptive_pool(student_features)
-            else:
-                student_features_adapted = student_features
+            # Ensure teacher & student tensors share the same dtype for fp16-safe gradients
+            teacher_features = teacher_features.to(student_features.dtype)   # keeps gradients fp16‑safe
 
-            vib_loss_value = vib_loss_fn(student_outputs['z_likelihoods'], None)
-            hd_loss_value = mse_loss_fn(student_features_adapted, teacher_target)
-            # Loss for this batch, to be divided by grad_accumulation_steps before backward
-            current_loss_value = (hd_loss_value + beta_stage1 * vib_loss_value)
+            # Debug feature statistics (only print occasionally to avoid spam)
+            if batch_idx == 0 and rank == 0:
+                print(f"\n=== FEATURE DEBUG (Epoch {epoch+1}, Batch {batch_idx+1}) ===")
+                print(f"Teacher features shape: {teacher_features.shape}")
+                print(f"Student features shape: {student_features.shape}")
+                print(f"Teacher: min={teacher_features.min().item():.6f}, max={teacher_features.max().item():.6f}, mean={teacher_features.mean().item():.6f}, std={teacher_features.std().item():.6f}")
+                print(f"Student: min={student_features.min().item():.6f}, max={student_features.max().item():.6f}, mean={student_features.mean().item():.6f}, std={student_features.std().item():.6f}")
+                print(f"MSE before loss: {torch.nn.functional.mse_loss(student_features, teacher_features).item():.6f}")
+                
+                # Check HD loss computation outside AMP
+                hd_loss_outside_amp = mse_loss_fn(student_features, teacher_features)
+                print(f"HD loss outside AMP: {hd_loss_outside_amp.item():.6f}")
+                print("=" * 50)
 
-        # Scale loss and backward pass
-        loss_to_backward = current_loss_value / grad_accumulation_steps
-        if use_amp:
-            scaler.scale(loss_to_backward).backward()
-        else:
-            loss_to_backward.backward()
+            # ── COSINE + MSE DISTORTION ───────────────────────────────
+            cos_sim = F.cosine_similarity(
+                          student_features.flatten(1),
+                          teacher_features.flatten(1),
+                          dim=1
+                      ).mean()
+            cos_loss = 1.0 - cos_sim                           
 
-        if (batch_idx + 1) % grad_accumulation_steps == 0:
-            if use_amp:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            optimizer.zero_grad(set_to_none=True) # set_to_none can save memory
-
-        # Accumulate losses for epoch average (use original non-accumulated loss for logging)
-        actual_total_loss = current_loss_value.item() # Log the loss for this step
-        running_loss += actual_total_loss
-        running_hd_loss += hd_loss_value.item()
-        running_vib_loss += vib_loss_value.item()
-
-        memory_info = {}
-        if monitor_memory and torch.cuda.is_available():
-            memory_info = get_gpu_memory_info()
-
-        progress_info = {
-            'Loss': f'{actual_total_loss:.4f}', # current batch loss
-            'HD': f'{hd_loss_value.item():.4f}',
-            'VIB': f'{vib_loss_value.item():.2f}',
-            'AvgLoss': f'{running_loss / (batch_idx + 1):.4f}' # running average
-        }
-        if monitor_memory and memory_info:
-            # Example: pick one metric or summarize; memory_info can be large
-            allocated_gb = memory_info.get(f'gpu{torch.cuda.current_device()}_allocated_gb', 0)
-            progress_info['GPU'] = f'{allocated_gb:.1f}GB'
-        pbar.set_postfix(progress_info)
-
-        if (batch_idx + 1) % log_freq == 0 and log_freq > 0 and hasattr(train_epoch, 'use_wandb') and train_epoch.use_wandb and rank == 0:
-            step = epoch * len(train_loader) + batch_idx + 1
-            log_dict_train = {
-                'train/batch_loss': actual_total_loss,
-                'train/batch_hd_loss': hd_loss_value.item(),
-                'train/batch_vib_loss': vib_loss_value.item(),
-                'train/learning_rate': optimizer.param_groups[0]['lr']
-            }
-            if monitor_memory and memory_info:
-                log_dict_train.update(memory_info)
-            wandb.log(log_dict_train, step=step)
-
-        if monitor_memory and (batch_idx + 1) % 200 == 0: # Less frequent cache clearing
-            torch.cuda.empty_cache()
+            hd_loss  = mse_loss_fn(student_features, teacher_features) \
+                       + lambda_cos * cos_loss                
+                
+            # Debug HD loss inside AMP  
+            if batch_idx == 0 and rank == 0:
+                print(f"MSE loss: {mse_loss_fn(student_features, teacher_features).item():.6f}")
+                print(f"Cosine loss: {cos_loss.item():.6f}")
+                print(f"Combined HD loss: {hd_loss.item():.6f}")
+                
+            vib_loss = vib_loss_fn(student_outputs['z_likelihoods'])
+            
+            # Debug VIB loss computation
+            if batch_idx == 0 and rank == 0:
+                print(f"\n=== VIB LOSS DEBUG ===")
+                z_liks = student_outputs['z_likelihoods']
+                print(f"z_likelihoods type: {type(z_liks)}")
+                print(f"z_likelihoods keys: {z_liks.keys() if isinstance(z_liks, dict) else 'Not a dict'}")
+                if isinstance(z_liks, dict) and 'z' in z_liks:
+                    z_tensor = z_liks['z']
+                    print(f"z_tensor shape: {z_tensor.shape}")
+                    print(f"z_tensor stats (densities): min={z_tensor.min().item():.6f}, max={z_tensor.max().item():.6f}, mean={z_tensor.mean().item():.6f}")
+                    # Note: VIBLossStage1 will clamp these densities at 1.0 for the loss calculation
+                    print(f"VIB normalization pixels: {28*28}")
+                print(f"VIB loss (BPP): {vib_loss.item():.6f}")
+                print(f"Beta weight: {current_beta}")
+                print(f"Weighted VIB: {(current_beta * vib_loss).item():.6f}")
+                print("=" * 30)
+                
+            total_loss = hd_loss + current_beta * vib_loss
+            
+            # Debug total loss composition
+            if batch_idx == 0 and rank == 0:
+                print(f"Total loss: {total_loss.item():.6f} = {hd_loss.item():.6f} + {(current_beta * vib_loss).item():.6f}")
+                print("=" * 50)
         
-        # For profiler step
-        if args.profile_batches > 0 and epoch == 0 and batch_idx < args.profile_batches :
-            if 'prof' in globals() and prof is not None: # Check if prof is defined
-                 prof.step()
+        # Check for NaN loss
+        if torch.isnan(total_loss):
+            print(f"ERROR: NaN loss detected at epoch {epoch+1}, batch {batch_idx}")
+            print(f"  total_loss: {total_loss.item()}, hd_loss: {hd_loss.item()}, vib_loss: {vib_loss.item()}")
+            print(f"  z_raw_mean: {student_outputs['debug_z_raw_mean'].item()}")
+            print(f"  z_hat_mean: {student_outputs['debug_z_hat_mean'].item()}")
+            print(f"  reconstructed_features_mean: {student_outputs['debug_reconstructed_features_mean'].item()}")
+            
+            # Additional debugging: check model parameters for NaN
+            for name, param in student_model.named_parameters():
+                if torch.isnan(param).any():
+                    print(f"  NaN detected in parameter: {name}")
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    print(f"  NaN detected in gradient: {name}")
+            
+            #Gracefully exit without saving corrupted checkpoints
+            if dist.is_initialized():
+                dist.destroy_process_group()
+            sys.exit(1)
+        
+        # Additional safety check for extreme loss values
+        if total_loss.item() > 1000 or torch.isinf(total_loss):
+            print(f"WARNING: Extreme loss detected at epoch {epoch+1}, batch {batch_idx}: {total_loss.item()}")
+            print(f"  Skipping backward pass for this batch")
+            continue
+        
+        scaler.scale(total_loss).backward()
+        
+        # Clip gradients to prevent exploding gradients
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(student_model.parameters(), config.training.grad_clip_norm)
+        
+        scaler.step(optimizer)
+        scaler.update()
+        
+        running_loss += total_loss.item()
+        running_hd_loss += hd_loss.item()
+        running_vib_loss += vib_loss.item()
 
+        if rank == 0:
+            # Debug loss accumulation (only occasionally)
+            if batch_idx == 0:
+                print(f"\n=== LOSS ACCUMULATION DEBUG ===")
+                print(f"Current HD loss: {hd_loss.item():.6f}")
+                print(f"Current VIB loss: {vib_loss.item():.6f}")
+                print(f"Running HD loss: {running_hd_loss:.6f}")
+                print(f"Running VIB loss: {running_vib_loss:.6f}")
+                print("=" * 30)
+                
+            # Debug what's actually being displayed
+            if batch_idx < 5:  # Show first few batches
+                print(f"About to display - HD: {hd_loss.item():.6f}, VIB: {vib_loss.item():.6f}")
+                
+            pbar.set_postfix({'Loss': f'{total_loss.item():.4f}', 'HD': f'{hd_loss.item():.4f}', 'VIB': f'{vib_loss.item():.4f}'})
 
-    # Final optimizer step if the number of batches is not perfectly divisible by accumulation steps
-    if len(train_loader) % grad_accumulation_steps != 0:
-        if use_amp:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+            # Log to wandb every log_freq batches
+            if config.project.use_wandb and (batch_idx + 1) % config.logging_and_saving.log_freq == 0:
+                wandb.log({
+                    'batch': epoch * len(train_loader) + batch_idx + 1,
+                    'train/batch_total_loss': total_loss.item(),
+                    'train/batch_hd_loss': hd_loss.item(),
+                    'train/batch_cos_loss': cos_loss.item(),         
+                    'train/batch_vib_loss': vib_loss.item(),
+                    'train/current_beta': current_beta,  # Beta warm-up tracking
+                    'train/learning_rate': optimizer.param_groups[0]['lr'],
+                    'debug/z_raw_mean': student_outputs['debug_z_raw_mean'].item(),
+                    'debug/z_hat_mean': student_outputs['debug_z_hat_mean'].item(),
+                    'debug/reconstructed_features_mean': student_outputs['debug_reconstructed_features_mean'].item(),
+                })
 
-    avg_epoch_loss = running_loss / len(train_loader)
-    avg_epoch_hd_loss = running_hd_loss / len(train_loader)
-    avg_epoch_vib_loss = running_vib_loss / len(train_loader)
+    avg_losses = {
+        'total': torch.tensor(running_loss / len(train_loader), device=device),
+        'hd': torch.tensor(running_hd_loss / len(train_loader), device=device),
+        'vib': torch.tensor(running_vib_loss / len(train_loader), device=device)
+    }
+    
+    for key in avg_losses:
+        dist.all_reduce(avg_losses[key], op=dist.ReduceOp.AVG)
+        avg_losses[key] = avg_losses[key].item()
+    return avg_losses
 
-    if is_ddp:
-        train_loss_tensor = torch.tensor(avg_epoch_loss, device=device)
-        dist.all_reduce(train_loss_tensor, op=dist.ReduceOp.AVG)
-        avg_epoch_loss = train_loss_tensor.item()
-
-        train_hd_tensor = torch.tensor(avg_epoch_hd_loss, device=device)
-        dist.all_reduce(train_hd_tensor, op=dist.ReduceOp.AVG)
-        avg_epoch_hd_loss = train_hd_tensor.item()
-
-        train_vib_tensor = torch.tensor(avg_epoch_vib_loss, device=device)
-        dist.all_reduce(train_vib_tensor, op=dist.ReduceOp.AVG)
-        avg_epoch_vib_loss = train_vib_tensor.item()
-
-    return avg_epoch_loss, avg_epoch_hd_loss, avg_epoch_vib_loss
-
-
-def validate(student_model, teacher_model, teacher_features, val_loader,
-             vib_loss_fn, mse_loss_fn, beta_stage1, device, epoch, use_amp, is_ddp):
-    """Validate the model."""
+def validate_epoch(student_model, teacher_model, val_loader, vib_loss_fn, mse_loss_fn, beta_warmup_epochs, beta_target, config, epoch, device, rank):
     student_model.eval()
-    teacher_model.eval()
+    
+    # Calculate current beta value (same as training)
+    if epoch < beta_warmup_epochs:
+        current_beta = beta_target * (epoch + 1) / beta_warmup_epochs
+    else:
+        current_beta = beta_target
+        
+    total_loss, total_hd_loss, total_vib_loss = 0.0, 0.0, 0.0
+    adaptive_pool = None
 
-    total_loss = 0.0
-    total_hd_loss = 0.0
-    total_vib_loss = 0.0
-    adaptive_pool_val = None
+    if rank == 0:
+        pbar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{config.training.num_epochs} [Val]', unit="batch")
+    else:
+        pbar = val_loader
 
     with torch.no_grad():
-        pbar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{args.num_epochs} [Val]', unit="batch")
-        for images, labels in pbar:
+        for images, _ in pbar:
             images = images.to(device, non_blocking=True)
-
-            teacher_layer2_features = teacher_model(images)
-
-            with autocast(enabled=use_amp):
+            teacher_features = teacher_model(images)
+            
+            with amp.autocast(device_type="cuda", dtype=torch.float16,
+                              enabled=config.training.use_amp):
                 student_outputs = student_model(images)
                 student_features = student_outputs['g_s_output']
-                teacher_target = teacher_layer2_features
 
-                if student_features.shape != teacher_target.shape:
-                    if adaptive_pool_val is None:
-                        target_spatial_size_val = teacher_target.shape[-2:]
-                        adaptive_pool_val = nn.AdaptiveAvgPool2d(target_spatial_size_val).to(device)
-                    student_features_adapted = adaptive_pool_val(student_features)
-                else:
-                    student_features_adapted = student_features
+                if student_features.shape != teacher_features.shape:
+                    if adaptive_pool is None:
+                        adaptive_pool = nn.AdaptiveAvgPool2d(teacher_features.shape[2:]).to(device)
+                    student_features = adaptive_pool(student_features)
+                
+                # Ensure teacher & student tensors share the same dtype for fp16-safe gradients
+                teacher_features = teacher_features.to(student_features.dtype)   # keeps gradients fp16‑safe
+                
+                hd_loss = mse_loss_fn(student_features, teacher_features)
+                vib_loss = vib_loss_fn(student_outputs['z_likelihoods'])
+                total_loss_batch = hd_loss + current_beta * vib_loss
+            
+            if torch.isnan(total_loss_batch):
+                print(f"WARNING: NaN loss detected during validation at epoch {epoch+1}")
+                print(f"  hd_loss: {hd_loss.item()}, vib_loss: {vib_loss.item()}")
+                # Log debug info if available
+                if 'debug_z_raw_mean' in student_outputs:
+                     print(f"  z_raw_mean: {student_outputs['debug_z_raw_mean'].item()}")
+                     print(f"  z_hat_mean: {student_outputs['debug_z_hat_mean'].item()}")
+                     print(f"  reconstructed_features_mean: {student_outputs['debug_reconstructed_features_mean'].item()}")
+            else:
+            total_loss += total_loss_batch.item()
+            total_hd_loss += hd_loss.item()
+            total_vib_loss += vib_loss.item()
 
-                vib_loss_value = vib_loss_fn(student_outputs['z_likelihoods'], None)
-                hd_loss_value = mse_loss_fn(student_features_adapted, teacher_target)
-                total_loss_value = hd_loss_value + beta_stage1 * vib_loss_value
+            if rank == 0:
+                pbar.set_postfix({'Loss': f'{total_loss / (pbar.n + 1):.4f}'})
 
-            total_loss += total_loss_value.item()
-            total_hd_loss += hd_loss_value.item()
-            total_vib_loss += vib_loss_value.item()
-
-            pbar.set_postfix({
-                'Loss': f'{total_loss_value.item():.4f}',
-                'HD': f'{hd_loss_value.item():.4f}',
-                'VIB': f'{vib_loss_value.item():.2f}',
-                'AvgLoss': f'{total_loss / (pbar.n + 1):.4f}'
-            })
-
-    avg_loss = total_loss / len(val_loader)
-    avg_hd_loss = total_hd_loss / len(val_loader)
-    avg_vib_loss = total_vib_loss / len(val_loader)
-
-    if is_ddp:
-        val_loss_tensor = torch.tensor(avg_loss, device=device)
-        dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
-        avg_loss = val_loss_tensor.item()
-
-        val_hd_tensor = torch.tensor(avg_hd_loss, device=device)
-        dist.all_reduce(val_hd_tensor, op=dist.ReduceOp.AVG)
-        avg_hd_loss = val_hd_tensor.item()
-
-        val_vib_tensor = torch.tensor(avg_vib_loss, device=device)
-        dist.all_reduce(val_vib_tensor, op=dist.ReduceOp.AVG)
-        avg_vib_loss = val_vib_tensor.item()
-
-    return avg_loss, avg_hd_loss, avg_vib_loss
-
-
-def get_gpu_memory_info():
-    """Get GPU memory usage information for the current device."""
-    if not torch.cuda.is_available():
-        return {}
-    
-    current_device = torch.cuda.current_device()
-    allocated = torch.cuda.memory_allocated(current_device) / 1024**3
-    reserved = torch.cuda.memory_reserved(current_device) / 1024**3 # Total memory reserved by allocator
-    max_allocated = torch.cuda.max_memory_allocated(current_device) / 1024**3 # Peak allocated
-    # max_reserved = torch.cuda.max_memory_reserved(current_device) / 1024**3 # Peak reserved
-    
-    props = torch.cuda.get_device_properties(current_device)
-    total_memory = props.total_memory / 1024**3
-
-    # Reset peak stats for next measurement interval if desired, but usually not needed per call
-    # torch.cuda.reset_peak_memory_stats(current_device)
-
-    return {
-        f'gpu{current_device}_allocated_gb': allocated,
-        f'gpu{current_device}_reserved_gb': reserved,
-        f'gpu{current_device}_max_allocated_gb': max_allocated,
-        # f'gpu{current_device}_max_reserved_gb': max_reserved,
-        f'gpu{current_device}_total_memory_gb': total_memory,
-        f'gpu{current_device}_free_approx_gb': total_memory - reserved # Free in PyTorch's view
+    avg_losses = {
+        'total': torch.tensor(total_loss / len(val_loader), device=device),
+        'hd': torch.tensor(total_hd_loss / len(val_loader), device=device),
+        'vib': torch.tensor(total_vib_loss / len(val_loader), device=device)
     }
+    
+    for key in avg_losses:
+        dist.all_reduce(avg_losses[key], op=dist.ReduceOp.AVG)
+        avg_losses[key] = avg_losses[key].item()
+    return avg_losses
 
 def main():
-    """Main training function."""
-    global args, prof
-    prof = None
-    parser = get_argparser()
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(description='MANTiS Stage 1 Training from config file')
+    parser.add_argument('--config', type=str, required=True, help='Path to the YAML configuration file.')
+    cli_args = parser.parse_args()
 
-    if "LOCAL_RANK" in os.environ:
+    with open(cli_args.config, 'r') as f:
+        config_dict = yaml.safe_load(f)
+    config = json.loads(json.dumps(config_dict), object_hook=lambda d: SimpleNamespace(**d))
+
+    # DDP Setup
+    is_ddp = "LOCAL_RANK" in os.environ
+    if is_ddp:
         dist.init_process_group(backend="nccl")
         local_rank = int(os.environ["LOCAL_RANK"])
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         torch.cuda.set_device(local_rank)
-        args.device = f"cuda:{local_rank}"
-        is_ddp = True
-        print(f"DDP enabled: Rank {rank}/{world_size} on GPU {local_rank}")
+        device = f"cuda:{local_rank}"
     else:
-        rank = 0
-        world_size = 1
-        local_rank = 0
-        is_ddp = False
-        if args.device == 'cuda' and not torch.cuda.is_available():
-            print("CUDA not available, switching to CPU")
-            args.device = 'cpu'
-        elif args.device == 'cuda':
-             torch.cuda.set_device(0)
-             args.device = 'cuda:0'
-
-    torch.backends.cudnn.benchmark = True
-
-    args.data_dir = os.path.expanduser(args.data_dir)
-    args.save_dir = os.path.expanduser(args.save_dir)
-
-    if args.use_amp and args.device == 'cpu':
-        if rank == 0:
-            print("Warning: AMP is requested but device is CPU. AMP will not be used.")
-        args.use_amp = False
-
-    scaler = GradScaler(enabled=args.use_amp) # Moved scaler init here
-
-    if args.use_wandb and rank == 0:
-        wandb_config = vars(args).copy()
-        if torch.cuda.is_available():
-             gpu_info_initial = get_gpu_memory_info()
-             wandb_config.update(gpu_info_initial)
-
-        wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name,
-            tags=args.wandb_tags,
-            config=wandb_config
-        )
-        train_epoch.use_wandb = True
-        print("✓ Wandb initialized")
-    else:
-        train_epoch.use_wandb = False
-
+        rank, world_size, local_rank = 0, 1, 0
+        device = config.training.device if torch.cuda.is_available() else "cpu"
+    
     if rank == 0:
-        print(f"MANTiS Stage 1 Training - PID: {os.getpid()}")
-        print(f"Torch version: {torch.__version__}")
-        if torch.cuda.is_available():
-            print(f"CUDA version: {torch.version.cuda}")
-            print(f"CuDNN version: {torch.backends.cudnn.version()}")
-            print(f"GPU: {torch.cuda.get_device_name(torch.cuda.current_device())}")
-        print(f"Using device: {args.device}")
-        print(f"Data directory: {args.data_dir}")
-        print(f"Batch size: {args.batch_size}, Grad Acc Steps: {args.grad_accumulation_steps}, Effective BS: {args.batch_size * args.grad_accumulation_steps}")
-        print(f"Num workers: {args.num_workers}, Prefetch factor: {args.prefetch_factor}")
+        print(f"Starting Stage 1 training. DDP: {is_ddp}, World Size: {world_size}, Device: {device}")
+        save_dir = Path(config.project.save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        with open(save_dir / 'config.yaml', 'w') as f:
+            yaml.dump(config_dict, f)
 
-        if args.use_amp:
-            print("Using Automatic Mixed Precision (AMP)")
-        if args.use_checkpointing:
-            print("Gradient Checkpointing requested (ensure model internals support it or are wrapped).")
+    if config.project.use_wandb and rank == 0:
+        wandb_run_name = config.project.wandb_run_name or f"s1_{time.strftime('%Y%m%d-%H%M%S')}"
+        wandb.init(project=config.project.wandb_project, name=wandb_run_name, tags=config.project.wandb_tags, config=config_dict)
+        print("✓ Wandb initialized.")
 
-
-    os.makedirs(args.save_dir, exist_ok=True)
-
-    if rank == 0:
-        print("\nLoading data...")
+    scaler = torch.amp.GradScaler('cuda', enabled=config.training.use_amp)
+    
+    config.data.data_dir = os.path.expanduser(config.data.data_dir)
     train_loader, val_loader = create_imagenet_webdataset_loaders(
-        data_dir=args.data_dir,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-        image_size=224
+        data_dir=config.data.data_dir,
+        batch_size=config.training.batch_size,
+        num_workers=config.data.num_workers,
+        prefetch_factor=config.data.prefetch_factor,
+        image_size=config.data.image_size
     )
-    if rank == 0:
-        print(f"Train loader approx batches (per GPU): {len(train_loader)}, Val loader approx batches (per GPU): {len(val_loader)}")
-        print(f"Global batch size: {args.batch_size * world_size}")
-
-    teacher_model, student_model, teacher_features = setup_models(args.device, args.use_checkpointing)
-
-    # Add checkpoint loading logic here if resuming from checkpoint
-    # This should be done before DDP wrapping
+    
+    teacher_model, student_model = setup_models(config, device, rank)
+    if is_ddp:
+        student_model = DDP(student_model, device_ids=[local_rank], find_unused_parameters=True)
+        
+    optimizer, scheduler, vib_loss_fn, mse_loss_fn, lambda_cos, beta_warmup_epochs, beta_target = setup_training(student_model, config)
+    
     start_epoch = 0
     best_val_loss = float('inf')
-    if args.resume_checkpoint:
-        if rank == 0:
-            print(f"Loading checkpoint from {args.resume_checkpoint}")
-        checkpoint = torch.load(args.resume_checkpoint, map_location=args.device)
-        
-        # Handle 'module.' prefix if checkpoint was saved from DDP model
-        state_dict = checkpoint['model_state_dict']
-        from collections import OrderedDict
-        new_state_dict = OrderedDict()
-        for k, v in state_dict.items():
-            name = k[7:] if k.startswith('module.') else k  # remove `module.` prefix
-            new_state_dict[name] = v
-        
-        student_model.load_state_dict(new_state_dict)  # Load into model before DDP wrapping
-        start_epoch = checkpoint['epoch']
-        best_val_loss = checkpoint.get('val_loss', float('inf'))
-        
-        if rank == 0:
-            print(f"Resuming from epoch {start_epoch}, best val loss: {best_val_loss:.4f}")
-        
-        if is_ddp:
-            dist.barrier()  # Ensure all processes load before proceeding
-
-    # Debug: Print parameter info to identify unused parameters
-    if rank == 0:
-        print("Model parameters:")
-        for i, (name, param) in enumerate(student_model.named_parameters()):
-            if i == 45:  # The problematic index from error message
-                print(f"----> Index {i}: {name}, Shape: {param.shape}, Requires Grad: {param.requires_grad}")
-            # Uncomment below to see all parameters for context
-            # else:
-            #     print(f"      Index {i}: {name}")
-
-    if is_ddp:
-        student_model = DDP(student_model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
-
-    optimizer, scheduler, vib_loss_fn, mse_loss_fn = setup_training(
-        student_model.module if isinstance(student_model, DDP) else student_model,
-        args.lr, args.weight_decay
-    )
-
-    # Load optimizer and scheduler state if resuming
-    if args.resume_checkpoint:
-        checkpoint = torch.load(args.resume_checkpoint, map_location=args.device)
+    
+    if hasattr(config.model, 'resume_checkpoint') and config.model.resume_checkpoint:
+        print(f"Resuming training from {config.model.resume_checkpoint}")
+        ckpt_path = os.path.expanduser(config.model.resume_checkpoint)
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        model_to_load = student_model.module if is_ddp else student_model
+        model_to_load.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        if args.use_amp and checkpoint.get('scaler_state_dict'):
-            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        start_epoch = checkpoint['epoch']
+        best_val_loss = checkpoint.get('val_loss', float('inf'))
+        if rank == 0: print(f"Resumed from epoch {start_epoch}, best val loss: {best_val_loss:.4f}")
+
+    for epoch in range(start_epoch, config.training.num_epochs):
+        if is_ddp:
+            # WebDataset samplers don't have set_epoch method
+            if hasattr(train_loader.sampler, 'set_epoch'):
+            train_loader.sampler.set_epoch(epoch)
+
+        train_losses = train_epoch(student_model, teacher_model, train_loader, optimizer, vib_loss_fn, mse_loss_fn, lambda_cos, beta_warmup_epochs, beta_target, config, epoch, device, rank, world_size, scaler)
+        val_losses = validate_epoch(student_model, teacher_model, val_loader, vib_loss_fn, mse_loss_fn, beta_warmup_epochs, beta_target, config, epoch, device, rank)
+        
         if rank == 0:
-            print("Optimizer, scheduler, and scaler states loaded")
-
-    if rank == 0:
-        print(f"\nStarting training for {args.num_epochs} epochs...")
-    best_val_loss = float('inf')
-
-    if args.profile_batches > 0 and args.device == 'cuda' and rank == 0:
-        print(f"Profiling the first {args.profile_batches} batches of epoch 0...")
-        profiler_log_dir = os.path.join(args.save_dir, 'profiler_traces')
-        os.makedirs(profiler_log_dir, exist_ok=True)
-
-        prof = torch.profiler.profile(
-             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-             schedule=torch.profiler.schedule(wait=1, warmup=1, active=args.profile_batches, repeat=1),
-             on_trace_ready=torch.profiler.tensorboard_trace_handler(profiler_log_dir),
-             record_shapes=True,
-             profile_memory=True,
-             with_stack=True
-        )
-        prof.start()
-        print(f"Profiler started. Traces will be saved to {profiler_log_dir}")
-
-
-    for epoch in range(start_epoch, args.num_epochs):
-        epoch_start_time = time.time()
-
-        train_loss, train_hd, train_vib = train_epoch(
-            student_model, teacher_model, teacher_features, train_loader,
-            optimizer, vib_loss_fn, mse_loss_fn, args.beta_stage1, epoch,
-            args.device, args.log_freq, args.grad_accumulation_steps,
-            args.use_amp, scaler, args.monitor_memory, is_ddp, rank
-        )
-
-        val_loss, val_hd, val_vib = validate(
-            student_model, teacher_model, teacher_features, val_loader,
-            vib_loss_fn, mse_loss_fn, args.beta_stage1, args.device, epoch, args.use_amp, is_ddp
-        )
-
-        scheduler.step()
-        epoch_time_taken = time.time() - epoch_start_time
-
-        if rank == 0:
-            print(f"\nEpoch {epoch+1}/{args.num_epochs} completed in {epoch_time_taken:.1f}s")
-            print(f"  Train - Loss: {train_loss:.4f}, HD: {train_hd:.4f}, VIB: {train_vib:.2f}")
-            print(f"  Val   - Loss: {val_loss:.4f}, HD: {val_hd:.4f}, VIB: {val_vib:.2f}")
-            print(f"  LR: {optimizer.param_groups[0]['lr']:.6e}")
-
-        if args.use_wandb and rank == 0:
-            log_dict_epoch = {
-                'epoch': epoch + 1,
-                'train/epoch_loss': train_loss,
-                'train/epoch_hd_loss': train_hd,
-                'train/epoch_vib_loss': train_vib,
-                'val/epoch_loss': val_loss,
-                'val/epoch_hd_loss': val_hd,
-                'val/epoch_vib_loss': val_vib,
-                'train/learning_rate_epoch': optimizer.param_groups[0]['lr'],
-                'time/epoch_time_seconds': epoch_time_taken,
-            }
-            if args.monitor_memory and torch.cuda.is_available():
-                log_dict_epoch.update(get_gpu_memory_info())
-            wandb.log(log_dict_epoch)
-
-        if (epoch + 1) % args.save_freq == 0 or val_loss < best_val_loss:
-            if rank == 0:
-                model_to_save = student_model.module if isinstance(student_model, DDP) else student_model
-                checkpoint = {
+            scheduler.step()
+            print(f"\nEpoch {epoch+1}/{config.training.num_epochs}")
+            print(f"  Train - Loss: {train_losses['total']:.4f} (HD: {train_losses['hd']:.4f}, VIB: {train_losses['vib']:.4f})")
+            print(f"  Val   - Loss: {val_losses['total']:.4f} (HD: {val_losses['hd']:.4f}, VIB: {val_losses['vib']:.4f})")
+            
+            # Calculate current beta for logging (same logic as in train_epoch)
+            if epoch < beta_warmup_epochs:
+                current_beta_epoch = beta_target * (epoch + 1) / beta_warmup_epochs
+            else:
+                current_beta_epoch = beta_target
+            print(f"  Beta: {current_beta_epoch:.6f} (target: {beta_target}, warmup: {epoch+1}/{beta_warmup_epochs})")
+            
+            if config.project.use_wandb:
+                wandb.log({
                     'epoch': epoch + 1,
-                    'model_state_dict': model_to_save.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'train_loss': train_loss,
-                    'val_loss': val_loss,
-                    'args': args,
-                    'scaler_state_dict': scaler.state_dict() if args.use_amp else None,
-                }
-                
-                save_path = os.path.join(args.save_dir, f'checkpoint_epoch_{epoch+1}.pth')
+                    'train/epoch_total_loss': train_losses['total'], 'train/epoch_hd_loss': train_losses['hd'], 'train/epoch_vib_loss': train_losses['vib'],
+                    'val/epoch_total_loss': val_losses['total'], 'val/epoch_hd_loss': val_losses['hd'], 'val/epoch_vib_loss': val_losses['vib'],
+                    'train/learning_rate': optimizer.param_groups[0]['lr'],
+                    'train/epoch_beta': current_beta_epoch,  # Beta warm-up tracking
+                })
+
+            is_best = val_losses['total'] < best_val_loss
+            if is_best: best_val_loss = val_losses['total']
+            
+            save_dir = Path(config.project.save_dir)
+            model_to_save = student_model.module if is_ddp else student_model
+            checkpoint = {
+                'epoch': epoch + 1, 'model_state_dict': model_to_save.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(), 'scheduler_state_dict': scheduler.state_dict(),
+                'val_loss': val_losses['total'], 'config': config_dict
+            }
+            
+            if (epoch + 1) % config.logging_and_saving.save_freq == 0:
+                save_path = save_dir / f'checkpoint_epoch_{epoch+1}.pth'
                 torch.save(checkpoint, save_path)
                 print(f"  Checkpoint saved to {save_path}")
-
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    best_path = os.path.join(args.save_dir, 'best_model.pth')
-                    torch.save(checkpoint, best_path)
-                    print(f"  ✓ New best model saved (val_loss: {val_loss:.4f}) at {best_path}")
-
-        if prof and epoch == 0 and args.profile_batches > 0 and rank == 0:
-            if args.profile_batches > 0 and epoch == 0:
-                 print("Exiting after profiling epoch 0 as per configuration (remove if multi-epoch profiling needed).")
-
-
-    if prof and prof.profiler is not None and rank == 0:
-        prof.stop()
-        print(f"Profiling finished. Traces saved to {os.path.join(args.save_dir, 'profiler_traces')}")
+            
+            if is_best:
+                best_path = save_dir / 'best_model.pth'
+                torch.save(checkpoint, best_path)
+                print(f"  ✓ New best model saved (val_loss: {best_val_loss:.4f}) at {best_path}")
 
     if rank == 0:
-        print(f"\n🎉 Training completed!")
-        print(f"Best validation loss: {best_val_loss:.4f}")
-        print(f"Checkpoints saved to: {args.save_dir}")
-
-    if args.use_wandb and rank == 0:
-        wandb.log({'model/final_best_val_loss': best_val_loss})
-        wandb.finish()
-        print("✓ Wandb run completed")
-
+        print("\n🎉 Stage 1 Training completed!")
+        if config.project.use_wandb: wandb.finish()
     if is_ddp:
         dist.destroy_process_group()
 
 if __name__ == '__main__':
-    # Note: If using torch.utils.checkpoint, DataParallel can sometimes interact unexpectedly.
-    # It's often recommended to apply DataParallel as the outermost wrapper.
-    # Ensure checkpointing logic is compatible with how DataParallel splits batches across GPUs.
     main()

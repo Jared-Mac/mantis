@@ -1,50 +1,47 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class TaskDetector(nn.Module):
     """
-    Task detector component that predicts task logits from stem features.
+    Task detector that predicts task ID from stem features.
     
-    Takes stem features f_stem and outputs task logits (before sigmoid).
+    Branches from the shared stem to predict which task the input image
+    corresponds to. Uses 96-channel features from increased FrankenSplit stem.
     """
     
-    def __init__(self, input_feat_dim, num_tasks, hidden_dim=64):
+    def __init__(self, input_channels=96, num_tasks=3):
+        """
+        Initialize task detector.
+        
+        Args:
+            input_channels: Number of input channels from stem (96)
+            num_tasks: Number of tasks to predict
+        """
         super().__init__()
         
-        self.num_tasks = num_tasks
-        
-        # Global average pooling to reduce spatial dimensions
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.flatten = nn.Flatten()
-        
-        # Multi-layer perceptron for task prediction
-        self.fc_layers = nn.Sequential(
-            nn.Linear(input_feat_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, num_tasks) # Output logits, remove Sigmoid
-            # Removed: nn.Sigmoid() 
-        )
+        # Global average pooling + classifier
+        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.classifier = nn.Linear(input_channels, num_tasks)
         
     def forward(self, f_stem):
         """
-        Predict task logits from stem features.
+        Forward pass to predict task ID.
         
         Args:
-            f_stem: Stem features (B, C, H, W)
+            f_stem: Features from shared stem (B, 96, H, W)
             
         Returns:
-            p_task_logits: Task logits (B, num_tasks)
+            task_logits: Task prediction logits (B, num_tasks)
         """
-        # Pool spatial dimensions
-        x = self.pool(f_stem)  # (B, C, 1, 1)
-        x = self.flatten(x)    # (B, C)
+        # Global average pooling: (B, 96, H, W) -> (B, 96, 1, 1)
+        pooled = self.global_avg_pool(f_stem)
         
-        # Predict task logits
-        p_task_logits = self.fc_layers(x)  # (B, num_tasks)
+        # Flatten: (B, 96, 1, 1) -> (B, 96)
+        flattened = pooled.view(pooled.size(0), -1)
         
-        return p_task_logits
+        # Classify: (B, 96) -> (B, num_tasks)
+        task_logits = self.classifier(flattened)
+        
+        return task_logits

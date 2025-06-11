@@ -1,157 +1,61 @@
-models:
-  teacher_model:
-    key: 'resnet50'
-    kwargs:
-      num_classes: 1000
-    _weights: !import_get
-      key: 'torchvision.models.resnet.ResNet50_Weights'
-    frozen_modules: [] # All parameters frozen by default for teacher
-    forward_hook:
-      input: []
-      output: ['layer3'] # Extract features from layer3 for head distillation
+project:
+  save_dir: './saved_checkpoints/stage1_from_config/'
+  use_wandb: true
+  wandb_project: 'mantis-stage1'
+  wandb_run_name: 'stage1-c96-frankensplit-152k'
+  wandb_tags: ['stage1', 'c96', 'frankensplit', '152k-params']
 
-  student_model:
-    key: 'mantis_stage1'
-    kwargs:
-      client_params:
-        stem_channels: 128
-        encoder_channels: 256
-        num_encoder_blocks: 3
-      decoder_params:
-        input_channels: 256
-        output_channels: 1024  # Match teacher layer3 output channels
-        num_blocks: 3
-      vib_channels: 256
-    forward_hook:
-      input: []
-      output: ['g_s_output', 'z_likelihoods']
+data:
+  data_dir: '~/imagenet-1k-wds'
+  num_workers: 1
+  prefetch_factor: 2
+  image_size: 224
 
-datasets:
-  train:
-    key: '!import_call'
-    _init:
-      module_path: 'webdataset'
-      class_name: 'WebDataset'
-    kwargs:
-      urls: !import_call
-        _init:
-          module_path: 'glob'
-          class_name: 'glob'
-        kwargs:
-          pathname: '~/imagenet-1k-wds/imagenet1k-train-*.tar'
-    _pipeline: !import_call
-      _init:
-        module_path: 'builtins'
-        class_name: 'lambda'
-      kwargs:
-        func: !python/object/apply:builtins.eval
-          args: 
-            - |
-              lambda ds: ds.shuffle(1000).decode("pil").to_tuple("jpg;png", "cls").map_tuple(
-                  torchvision.transforms.Compose([
-                      torchvision.transforms.RandomResizedCrop(224),
-                      torchvision.transforms.RandomHorizontalFlip(),
-                      torchvision.transforms.ToTensor(),
-                      torchvision.transforms.Normalize(
-                          mean=[0.485, 0.456, 0.406],
-                          std=[0.229, 0.224, 0.225]
-                      )
-                  ]),
-                  lambda x: int(x)
-              ).with_length(1281167)
+model:
+  # Model configuration  
+  type: 'mantis_stage1'
+  config:
+    # Client parameters (FrankenSplit architecture: 3→96→48→48 channels)
+    client_params:
+      stem_channels: 96      # Increased stem output (was 64)
+      encoder_channels: 48   # Final encoder output
+      num_tasks: 4      # Number of tasks (for client initialization)
+    
+    # Decoder parameters (for Stage 1 feature reconstruction)
+    decoder_params:
+      input_channels: 48     # VIB bottleneck channels (matches vib_channels)
+      output_channels: 512   # Teacher feature dimensions (ResNet50 layer2)
+    
+    # VIB bottleneck
+    vib_channels: 48  # Matches encoder output
+  resume_checkpoint: null # Optional path to stage1 checkpoint to resume training from
+  client:
+    vib_channels: 48
+    encoder_channels: 48  
+    stem_channels: 96  # Updated to match increased architecture
 
-  val:
-    key: '!import_call'
-    _init:
-      module_path: 'webdataset'
-      class_name: 'WebDataset'
-    kwargs:
-      urls: !import_call
-        _init:
-          module_path: 'glob'
-          class_name: 'glob'
-        kwargs:
-          pathname: '~/imagenet-1k-wds/imagenet1k-validation-*.tar'
-    _pipeline: !import_call
-      _init:
-        module_path: 'builtins'
-        class_name: 'lambda'
-      kwargs:
-        func: !python/object/apply:builtins.eval
-          args: 
-            - |
-              lambda ds: ds.decode("pil").to_tuple("jpg;png", "cls").map_tuple(
-                  torchvision.transforms.Compose([
-                      torchvision.transforms.Resize(256),
-                      torchvision.transforms.CenterCrop(224),
-                      torchvision.transforms.ToTensor(),
-                      torchvision.transforms.Normalize(
-                          mean=[0.485, 0.456, 0.406],
-                          std=[0.229, 0.224, 0.225]
-                      )
-                  ]),
-                  lambda x: int(x)
-              ).with_length(50000)
-
-train:
+training:
+  device: 'cuda'
   num_epochs: 100
-  batch_size: 64
-  log_freq: 100
-  
+  batch_size: 32
+  grad_accumulation_steps: 1
+  grad_clip_norm: 0.5
+  use_amp: true
+  beta_warmup_epochs: 25  # Beta warm-up duration
   optimizer:
-    key: 'AdamW'
-    kwargs:
-      lr: 0.0001
-      weight_decay: 0.01
-
+    lr: 0.00005
+    weight_decay: 0.01
   scheduler:
-    key: 'CosineAnnealingLR'
-    kwargs:
-      T_max: 100
-      eta_min: 0.00001
+    type: 'CosineAnnealingLR'
+    params:
+      T_max: 50 # Should match num_epochs
+      eta_min: 0.0000005
+  loss_weights:
+    beta_stage1: 0.01
+    lambda_cos: 0.3
 
-  criterion:
-    key: 'WeightedSumLoss'
-    kwargs:
-      sub_terms:
-        hd_loss: # Head distillation loss
-          criterion:
-            key: 'MSELoss'
-            kwargs:
-              reduction: 'mean'
-          criterion_wrapper:
-            key: 'SimpleLossWrapper'
-            kwargs:
-              input:
-                is_from_teacher: False
-                module_path: '.'
-                io: 'g_s_output'
-              target:
-                is_from_teacher: True
-                module_path: 'layer3'
-                io: 'output'
-          weight: 1.0
-
-        rate_loss: # VIB rate term
-          criterion:
-            key: 'vib_loss_stage1'
-            kwargs:
-              num_pixels_placeholder: 65536  # 256*256 placeholder
-          criterion_wrapper:
-            key: 'SimpleLossWrapper'
-            kwargs:
-              input:
-                is_from_teacher: False
-                module_path: '.'
-                io: 'z_likelihoods'
-              target:
-                uses_label: False
-          weight: 0.01  # beta_stage1
-
-test:
-  test_data_loader_type: 'val'
-  log_freq: 1000
-
-save:
-  checkpoint_interval: 10
-  checkpoint_path: './saved_checkpoints/stage1/' 
+logging_and_saving:
+  log_freq: 200
+  save_freq: 1
+  monitor_memory: true
+  profile_batches: 0 
